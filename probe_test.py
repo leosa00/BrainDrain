@@ -49,13 +49,24 @@ import secret
 # Targets
 # ─────────────────────────────────────────────────────────────────────────────
 
-google = TargetConfig(
+google_free = TargetConfig(
     base_url="https://generativelanguage.googleapis.com/v1beta/openai",
     model="gemini-2.5-flash",
     api_format=APIFormat.CUSTOM,
-    api_key=secret.google_api,
+    api_key=secret.google_api_paid,
     timeout=120.0,
 )
+
+
+google_paid = TargetConfig(
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+    model="gemini-2.5-flash-lite",
+    api_format=APIFormat.CUSTOM,
+    api_key=secret.google_api_paid,   # same AIza... key, billing just needs to
+    timeout=120.0,                    # be enabled in GCP console for this project
+    supports_stream_options=True,
+)
+
 
 local = TargetConfig(
     base_url="http://localhost:11434",
@@ -65,7 +76,7 @@ local = TargetConfig(
     timeout=120.0,
 )
 
-TARGET = local   # ← switch to `local` for unlimited local testing
+TARGET = local  # ← switch to `local` for unlimited local testing
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,24 +104,16 @@ class TokenBucketRateLimiter:
         return await self.acquire_many(1)
 
     async def acquire_many(self, n: int) -> float:
-        """
-        Block until n tokens are available, then consume them atomically.
-
-        Used by burst_probe to pre-acquire all N slots before spawning
-        concurrent tasks, so the tasks themselves need no per-request wait.
-        """
         t_start = time.monotonic()
-        needed  = float(n)
+        needed = float(n)
         while True:
             async with self._lock:
                 self._refill()
                 if self._tokens >= needed:
                     self._tokens -= needed
                     return time.monotonic() - t_start
-            # Compute how long until `needed` tokens accumulate
-            async with self._lock:
                 deficit = needed - self._tokens
-                wait_s  = deficit / max(self._rate, 1e-9)
+                wait_s = deficit / max(self._rate, 1e-9)
             await asyncio.sleep(max(0.05, wait_s * 0.9))
 
 
@@ -367,7 +370,7 @@ def dump(d: dict, indent: int = 2) -> None:
 async def suite_baseline(probes: RateLimitedITLProbes, rpd: RPDTracker) -> None:
     header("SUITE: calibrate_baseline()", rpd)
     # Use 3 samples + 1 warm-up to keep RPD cost low on free tier
-    result = await probes.calibrate_baseline(n_samples=3, warm_up=1, inter_delay_s=0.1)
+    result = await probes.calibrate_baseline(n_samples=8, warm_up=1, inter_delay_s=0.1)
     dump(result)
 
 
@@ -384,7 +387,7 @@ async def suite_single(probes: RateLimitedITLProbes, rpd: RPDTracker) -> None:
         max_tokens=80,
     )
     dump(r.to_dict())
-
+    print(f"  raw_text: {repr(r.raw_text)}")
 
 async def suite_ttft(probes: RateLimitedITLProbes, rpd: RPDTracker) -> None:
     header("SUITE: ttft_probe()", rpd)
@@ -603,10 +606,10 @@ SUITE_RPD_COST: Dict[str, int] = {
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def main(suite_name: str, rpm: float) -> None:
+async def main(suite_name: str, rpm: float, burst_size: int,daily_budget: int,abort_at: int) -> None:
     # ── Rate-limiting primitives ──────────────────────────────────────────────
-    limiter = TokenBucketRateLimiter(rate_per_minute=rpm, burst_size=2)
-    rpd     = RPDTracker(daily_budget=250, warn_at=200, abort_at=248)
+    limiter = TokenBucketRateLimiter(rate_per_minute=rpm, burst_size=burst_size)
+    rpd     = RPDTracker(daily_budget=daily_budget, warn_at=int(daily_budget * 0.8), abort_at=abort_at)
 
     # ── Pre-flight RPD budget check ───────────────────────────────────────────
     suites_to_run = ALL_ORDER if suite_name == "all" else (
@@ -626,7 +629,7 @@ async def main(suite_name: str, rpm: float) -> None:
           f"(estimated cost: {estimated_cost})")
 
     # ── Build probe engine ────────────────────────────────────────────────────
-    cfg = ProbeConfig(
+    cfg_free = ProbeConfig(
         target=TARGET,
         token_budget=50,
         temperature=0.0,
@@ -639,7 +642,24 @@ async def main(suite_name: str, rpm: float) -> None:
         itl_cv_thrash_threshold=0.5,
         regressor_backend="linear",
     )
-    probes = RateLimitedITLProbes(cfg, limiter, rpd)
+
+    cfg = ProbeConfig(
+        target=TARGET,
+        token_budget=512,            # ← was 50
+        temperature=0.0,
+        baseline_window=3,
+        burst_concurrency=3,
+        rolling_window=20,
+        itl_fill_threshold=2.0,
+        itl_saturated_threshold=4.0,
+        ttft_hol_threshold=2.0, #change to 5.0 for vLLM default
+        itl_cv_thrash_threshold=1.2,
+        regressor_backend="linear",
+        # Gemini 2.5 Flash: disable thinking for probe requests so tokens
+        # are not wasted on reasoning — probes need fast, cheap responses
+        #probe_extra_body={"thinking": {"type": "disabled"}},
+    )
+    probes = RateLimitedITLProbes(cfg_free, limiter, rpd)
 
     try:
         if suite_name == "all":
@@ -671,7 +691,35 @@ if __name__ == "__main__":
         "--rpm",
         type=float,
         default=8.0,
-        help="Effective RPM cap (default: 8 — conservative margin under Gemini's 10 RPM limit)",
+        help="Effective RPM cap (default: 8)",
+    )
+    parser.add_argument(
+        "--burst-size",
+        type=int,
+        default=3,
+        dest="burst_size",
+        help="Token bucket burst capacity (default: 2)",
+    )
+    parser.add_argument(
+        "--daily-budget",
+        type=int,
+        default=250,
+        dest="daily_budget",
+        help="Max requests per day before hard abort (default: 250)",
+    )
+    parser.add_argument(
+        "--abort-at",
+        type=int,
+        default=248,
+        dest="abort_at",
+        help="RPD count at which to hard-abort (default: 248)",
     )
     args = parser.parse_args()
-    asyncio.run(main(args.suite, args.rpm))
+
+    asyncio.run(main(
+        suite_name=args.suite,
+        rpm=args.rpm,
+        burst_size=args.burst_size,
+        daily_budget=args.daily_budget,
+        abort_at=args.abort_at,
+    ))

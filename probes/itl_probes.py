@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Deque, List, Optional
 
+
+import math
 import aiohttp
 import numpy as np
 
@@ -80,6 +82,7 @@ class ProbeResult:
     probe_id:      str   = field(default_factory=lambda: str(uuid.uuid4())[:8])
     timestamp:     float = field(default_factory=time.time)
     probe_type:    str   = "unknown"
+    raw_text: str = ""
 
     # Core latency
     ttft_s:        float       = 0.0
@@ -105,13 +108,20 @@ class ProbeResult:
             return
         ms = [v * 1000.0 for v in self.itl_values]
         n  = len(ms)
-        self.tokens_out    = n
+        self.chunk_count    = n
+        if n > 1 and len(self.raw_text.split()) > n:
+            # Hosted API — chunks contain multiple tokens, use word estimate
+            self.tokens_out = len(self.raw_text.split())
+        else:
+            # vLLM / Ollama — one token per chunk, chunk count is accurate
+            self.tokens_out = n
         self.mean_itl_ms   = statistics.mean(ms)
         self.tpot_ms       = self.mean_itl_ms
         self.itl_stddev_ms = statistics.stdev(ms) if n > 1 else 0.0
         s = sorted(ms)
-        self.p95_itl_ms = s[max(int(0.95 * n) - 1, 0)]
-        self.p99_itl_ms = s[max(int(0.99 * n) - 1, 0)]
+        # correct: clamp to [0, n-1], never subtract 1 before clamping
+        self.p95_itl_ms = s[min(int(math.ceil(0.95 * n)) - 1, n - 1)]
+        self.p99_itl_ms = s[min(int(math.ceil(0.99 * n)) - 1, n - 1)]
 
     def to_dict(self) -> dict:
         return {
@@ -152,17 +162,27 @@ class BurstProbeResult:
         self.n_success = len(good)
         if not good:
             return
-        ttfts = [r.ttft_s for r in good]
-        itls  = [r.mean_itl_ms for r in good]
-        n     = len(good)
+
+        ttfts = sorted([r.ttft_s      for r in good])
+        itls  = sorted([r.mean_itl_ms for r in good if r.mean_itl_ms > 0])  # exclude zero-token probes
+        n_t   = len(ttfts)
+        n_i   = len(itls)
+
         self.mean_ttft_s   = statistics.mean(ttfts)
-        self.ttft_stddev_s = statistics.stdev(ttfts) if n > 1 else 0.0
-        self.mean_itl_ms   = statistics.mean(itls)
-        self.itl_stddev_ms = statistics.stdev(itls) if n > 1 else 0.0
-        st = sorted(ttfts)
-        si = sorted(itls)
-        self.p95_ttft_s  = st[max(int(0.95 * n) - 1, 0)]
-        self.p95_itl_ms  = si[max(int(0.95 * n) - 1, 0)]
+        self.ttft_stddev_s = statistics.stdev(ttfts) if n_t > 1 else 0.0
+        self.mean_itl_ms   = statistics.mean(itls)   if itls else 0.0
+        self.itl_stddev_ms = statistics.stdev(itls)  if n_i > 1 else 0.0
+
+        # ── OLD (floor − 1 picks median for small n) ──────────────────────
+        # self.p95_ttft_s = st[max(int(0.95 * n) - 1, 0)]
+        # self.p95_itl_ms = si[max(int(0.95 * n) - 1, 0)]
+
+        # ── NEW (ceil then clamp — always picks the highest sample for n<20)
+        if n_t > 0:
+            self.p95_ttft_s = ttfts[min(int(math.ceil(0.95 * n_t)) - 1, n_t - 1)]
+        if n_i > 0:
+            self.p95_itl_ms = itls [min(int(math.ceil(0.95 * n_i)) - 1, n_i - 1)]
+
         kv = [r.kv_usage_est for r in good if r.kv_usage_est >= 0]
         if kv:
             self.kv_usage_est = statistics.mean(kv)
@@ -180,7 +200,6 @@ class BurstProbeResult:
             "kv_usage_est":  round(self.kv_usage_est, 4),
         }
 
-
 # ─────────────────────────────────────────────
 # Probe Config
 # ─────────────────────────────────────────────
@@ -190,7 +209,7 @@ class ProbeConfig:
     target: TargetConfig
 
     # Probe request sizing (keep minimal to avoid self-inflicted load)
-    token_budget:        int   = 50     # max_tokens for standard probe
+    token_budget:        int   = 512    # max_tokens for standard probe
     temperature:         float = 0.0
 
     # Baseline calibration
@@ -212,7 +231,7 @@ class ProbeConfig:
 
     # KV usage regressor backend: "lightgbm" | "linear" | "none"
     regressor_backend:   str  = "linear"
-
+    probe_extra_body:    dict = field(default_factory=dict)
 
 # ─────────────────────────────────────────────
 # KV Usage Estimator
@@ -324,9 +343,10 @@ class KVUsageEstimator:
         mean_itl = float(np.mean(itl_ms))
         if self._baseline_itl_ms <= 0:
             return 0.0
-        pressure = (mean_itl - self._baseline_itl_ms) / self._baseline_itl_ms
-        return float(np.clip(pressure, 0.0, 1.0))
 
+        raw = (mean_itl - self._baseline_itl_ms) / self._baseline_itl_ms
+        soft = raw / (1.0 + abs(raw))
+        return float(np.clip(soft, 0.0, 1.0))
 
 # ─────────────────────────────────────────────
 # Core Probe Engine
@@ -348,13 +368,13 @@ class ITLProbes:
 
     # Deliberately innocuous probe prompts — blend with organic traffic
     _PROMPTS: dict[str, str] = {
-        "minimal":    "Say 'ok'.",
-        "short":      "Count from 1 to 10.",
-        "medium":     "List 20 common English words, one per line.",
-        "fixed_50":   "Reply with exactly fifty words on any topic.",
-        "fixed_100":  "Write exactly one hundred words on any topic.",
-        "repeat_50":  "Repeat the word 'echo' fifty times, separated by spaces.",
-        "paragraph":  "Write a short paragraph of about 50 words on the weather.",
+        "minimal":   "Reply with only the single word: ok",
+        "short":     "Count from 1 to 10, each number on a new line.",
+        "medium":    "List 20 common English words, one per line.",
+        "fixed_50":  "Write a paragraph of at least 60 words about the ocean. Do not use bullet points.",
+        "fixed_100": "Write two paragraphs totaling at least 120 words about climate change.",
+        "repeat_50": "List every number from 1 to 50, each on its own line.",
+        "paragraph": "Write a paragraph of about 50 words on the weather.",
     }
 
     def __init__(self, config: ProbeConfig) -> None:
@@ -410,6 +430,9 @@ class ITLProbes:
                 "num_predict": max_tokens,
                 "temperature": self.config.temperature,
             }
+
+        if self.config.probe_extra_body:
+            base.update(self.config.probe_extra_body)
 
         return base
 
@@ -499,6 +522,7 @@ class ITLProbes:
                                 result.ttft_s = t_now - t_start
                             result.itl_values.append(t_now - t_last)
                             t_last = t_now
+                            result.raw_text += token   
 
         except asyncio.TimeoutError:
             result.success, result.error = False, "timeout"
@@ -1049,21 +1073,26 @@ class ITLProbes:
         if not good:
             return {"success": False, "error": "no successful probes", "n": 0}
 
-        tpots        = [r.tpot_ms for r in good]
+        tpots        = sorted([r.tpot_ms for r in good])
+        n            = len(tpots)
         baseline_itl = max(self.config.baseline_itl_ms, 1e-6)
         mean_tpot    = statistics.mean(tpots)
         tpot_ratio   = mean_tpot / baseline_itl
 
+
+        p95_idx = min(int(math.ceil(0.95 * n)) - 1, n - 1)
+
         return {
             "success":         True,
-            "n":               len(good),
+            "n":               n,
             "mean_tpot_ms":    round(mean_tpot, 3),
-            "p95_tpot_ms":     round(sorted(tpots)[max(int(0.95 * len(tpots)) - 1, 0)], 3),
-            "tpot_stddev_ms":  round(statistics.stdev(tpots) if len(tpots) > 1 else 0.0, 3),
+            "p95_tpot_ms":     round(tpots[p95_idx], 3),
+            "tpot_stddev_ms":  round(statistics.stdev(tpots) if n > 1 else 0.0, 3),
             "tpot_ratio":      round(tpot_ratio, 3),
             "baseline_itl_ms": round(baseline_itl, 3),
             "degraded":        tpot_ratio > self.config.itl_fill_threshold,
         }
+
 
     async def request_timeout_probe(
         self,
@@ -1072,13 +1101,6 @@ class ITLProbes:
         prompt:       Optional[str] = None,
         max_tokens:   int           = 100,
     ) -> dict:
-        """
-        Detect whether the scheduler is actively aborting or partially serving
-        requests (HTTP 429, 503, mid-stream disconnect, partial response).
-
-        A high abort_rate confirms SATURATED / THRASHING state and that the
-        Fill phase has successfully exhausted available KV capacity.
-        """
         p = prompt or self._PROMPTS["fixed_50"]
 
         async def _one() -> tuple:
@@ -1087,27 +1109,29 @@ class ITLProbes:
                     self._stream_probe(p, max_tokens, probe_type="abort_probe"),
                     timeout=hard_timeout,
                 )
-                partial = r.success and r.tokens_out < max_tokens // 2
-                return r.success, r.tokens_out, ("partial" if partial else None)
+                # ── partial = completed suspiciously fast with zero content
+                # Do NOT use chunk count — hosted APIs batch chunks arbitrarily
+                suspiciously_fast = r.success and r.total_s < 0.3
+                return r.success, r.tokens_out, ("partial" if suspiciously_fast else None)
             except asyncio.TimeoutError:
                 return False, 0, "client_timeout"
             except Exception as exc:
                 return False, 0, str(exc)
 
-        raw      = list(await asyncio.gather(*[_one() for _ in range(n_probes)]))
-        n_ok     = sum(1 for ok, _, __ in raw if ok)
-        n_part   = sum(1 for _, __, e  in raw if e == "partial")
-        n_fail   = n_probes - n_ok
-        errors   = [e for _, __, e in raw if e and e != "partial"]
+        raw    = list(await asyncio.gather(*[_one() for _ in range(n_probes)]))
+        n_ok   = sum(1 for ok, _, __ in raw if ok)
+        n_part = sum(1 for _, __, e  in raw if e == "partial")
+        n_fail = n_probes - n_ok
+        errors = [e for _, __, e in raw if e and e != "partial"]
 
         return {
-            "n_probes":            n_probes,
-            "n_success":           n_ok,
-            "n_partial":           n_part,
-            "n_failed":            n_fail,
-            "abort_rate":          round(n_fail  / max(n_probes, 1), 4),
-            "partial_rate":        round(n_part  / max(n_probes, 1), 4),
-            "error_types":         list(set(errors)),
+            "n_probes":             n_probes,
+            "n_success":            n_ok,
+            "n_partial":            n_part,
+            "n_failed":             n_fail,
+            "abort_rate":           round(n_fail  / max(n_probes, 1), 4),
+            "partial_rate":         round(n_part  / max(n_probes, 1), 4),
+            "error_types":          list(set(errors)),
             "scheduler_overloaded": (n_fail / max(n_probes, 1)) > 0.3,
         }
 
@@ -1155,4 +1179,37 @@ class ITLProbes:
             "c_sat":        c_sat,
             "state":        state.value,
             "probe":        result.to_dict(),
+        }
+
+    def rolling_summary(self) -> dict:
+        """Aggregate stats over the last `rolling_window` successful probes."""
+        good = [r for r in self._itl_history if r.success and r.mean_itl_ms > 0]
+        if not good:
+            return {"n": 0, "calibrated": self._baseline_calibrated}
+
+        itls  = [r.mean_itl_ms for r in good]
+        ttfts = [r.ttft_s      for r in good]
+        kvs   = [r.kv_usage_est for r in good if r.kv_usage_est >= 0]
+        n     = len(good)
+
+        slope = float(np.polyfit(np.arange(n), itls, 1)[0]) if n >= 2 else 0.0
+
+        baseline_itl = max(self.config.baseline_itl_ms, 1e-6)
+        degradation  = statistics.mean(itls) / baseline_itl
+
+        s = sorted(itls)
+        p95_idx = min(int(math.ceil(0.95 * n)) - 1, n - 1)
+
+        return {
+            "n":                      n,
+            "calibrated":             self._baseline_calibrated,
+            "mean_itl_ms":            round(statistics.mean(itls), 3),
+            "p95_itl_ms":             round(s[p95_idx], 3),
+            "itl_stddev_ms":          round(statistics.stdev(itls) if n > 1 else 0.0, 3),
+            "itl_slope_ms_per_probe": round(slope, 4),
+            "mean_ttft_s":            round(statistics.mean(ttfts), 4),
+            "mean_kv_est":            round(statistics.mean(kvs), 4) if kvs else -1.0,
+            "degradation_ratio":      round(degradation, 3),
+            "current_state":          self.classify_state().value,
+            "baseline_itl_ms":        round(self.config.baseline_itl_ms, 3),
         }
