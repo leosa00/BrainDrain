@@ -42,15 +42,17 @@ class APIFormat(Enum):
 
 @dataclass
 class TargetConfig:
-    """Describes the LLM endpoint under test."""
-    base_url: str                          # e.g. "http://localhost:8000"
-    model: str                             # e.g. "deepseek-r1", "gpt-4o"
-    api_format: APIFormat = APIFormat.OPENAI
-    api_key: Optional[str] = None
-    endpoint_path: Optional[str] = None   # override default path per format
-    timeout: float = 120.0                # per-request hard timeout (seconds)
-    verify_ssl: bool = True
-    extra_headers: dict[str, str] = field(default_factory=dict)
+    base_url:             str
+    model:                str
+    api_format:           APIFormat = APIFormat.OPENAI
+    api_key:              Optional[str] = None
+    endpoint_path:        Optional[str] = None
+    timeout:              float = 120.0
+    verify_ssl:           bool  = True
+    extra_headers:        dict[str, str] = field(default_factory=dict)
+    # NEW: set False for any endpoint that rejects OpenAI stream_options
+    # (Ollama /v1 shim, LM Studio older builds, some Azure deployments)
+    supports_stream_options: bool = True
 
     @property
     def endpoint(self) -> str:

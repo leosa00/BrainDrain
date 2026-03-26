@@ -384,12 +384,7 @@ class ITLProbes:
 
     # ── Payload construction ──────────────────────────────────────────────────
 
-    def _build_payload(
-        self,
-        prompt:     str,
-        max_tokens: int,
-        stream:     bool = True,
-    ) -> dict[str, Any]:
+    def _build_payload(self, prompt: str, max_tokens: int, stream: bool = True) -> dict:
         fmt  = self.config.target.api_format
         msgs = [{"role": "user", "content": prompt}]
         base: dict[str, Any] = {
@@ -401,7 +396,8 @@ class ITLProbes:
         if fmt in (APIFormat.OPENAI, APIFormat.CUSTOM, APIFormat.TEST):
             base["messages"]   = msgs
             base["max_tokens"] = max_tokens
-            if stream:
+            # Only include if the endpoint explicitly supports it
+            if stream and self.config.target.supports_stream_options:
                 base["stream_options"] = {"include_usage": True}
 
         elif fmt == APIFormat.ANTHROPIC:
@@ -469,21 +465,40 @@ class ITLProbes:
                     result.error   = f"HTTP {resp.status}: {(await resp.text())[:200]}"
                     return result
 
+                buf  = b""
+                done = False
                 async for raw in resp.content:
-                    line = raw.decode("utf-8").strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
+                    if done:
                         break
-                    t_now = time.perf_counter()
-                    token = self._extract_token(data_str)
-                    if token is not None:
-                        if t_first is None:
-                            t_first       = t_now
-                            result.ttft_s = t_now - t_start
-                        result.itl_values.append(t_now - t_last)
-                        t_last = t_now
+                    buf += raw
+                    while b"\n" in buf:
+                        line_b, buf = buf.split(b"\n", 1)
+                        line = line_b.decode("utf-8", errors="replace").strip()
+
+                        # ── Ollama native NDJSON (no "data:" prefix) ─────────
+                        # APIFormat.OLLAMA sends raw JSON lines, not SSE.
+                        # CUSTOM/OPENAI pointing at Ollama's /v1 endpoint sends SSE.
+                        if self.config.target.api_format == APIFormat.OLLAMA:
+                            if not line:
+                                continue
+                            data_str = line
+                        else:
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+
+                        if data_str == "[DONE]":
+                            done = True
+                            break
+
+                        t_now = time.perf_counter()
+                        token = self._extract_token(data_str)
+                        if token is not None:
+                            if t_first is None:
+                                t_first       = t_now
+                                result.ttft_s = t_now - t_start
+                            result.itl_values.append(t_now - t_last)
+                            t_last = t_now
 
         except asyncio.TimeoutError:
             result.success, result.error = False, "timeout"
@@ -931,9 +946,213 @@ class ITLProbes:
 
     async def monitor(
         self,
-        interval_s:       float                                             = 2.0,
-        on_probe:         Optional[Callable[[ProbeResult, InfraState], None]] = None,
-        on_state_change:  Optional[Callable[[InfraState, InfraState], None]]  = None,
-        stop_event:       Optional[asyncio.Event]                           = None,
-        max_iterations:   Optional[int]                                     = None,
+        interval_s:      float                                               = 2.0,
+        on_probe:        Optional[Callable[[ProbeResult, InfraState], None]] = None,
+        on_state_change: Optional[Callable[[InfraState, InfraState], None]]  = None,
+        stop_event:      Optional[asyncio.Event]                             = None,
+        max_iterations:  Optional[int]                                       = None,
     ) -> None:
+        """
+        Continuous async polling loop for real-time infra state tracking.
+
+        Fires single_probe() every `interval_s` seconds, classifies InfraState,
+        and invokes optional async-or-sync callbacks:
+        on_probe(result, state)      — every probe cycle
+        on_state_change(old, new)    — only on InfraState transitions
+
+        Designed to run as a background asyncio.Task alongside attack workers:
+
+            stop = asyncio.Event()
+            task = asyncio.create_task(probes.monitor(
+                interval_s=2.0,
+                on_state_change=lambda old, new: dispatch_fill_squeeze(new),
+                stop_event=stop,
+            ))
+            # ... run attack ...
+            stop.set()
+            await task
+
+        Parameters
+        ──────────
+        interval_s      — seconds between probe cycles
+        on_probe        — callback(ProbeResult, InfraState) every cycle
+        on_state_change — callback(old_state, new_state) on transitions only
+        stop_event      — asyncio.Event; set() to terminate the loop cleanly
+        max_iterations  — hard cap on probe count (None = run forever)
+        """
+        prev_state = InfraState.UNKNOWN
+        iteration  = 0
+        _stop      = stop_event or asyncio.Event()
+
+        while not _stop.is_set():
+            if max_iterations is not None and iteration >= max_iterations:
+                break
+
+            t_cycle_start = time.perf_counter()
+
+            result = await self.single_probe()
+            state  = self.classify_state(probe=result)
+
+            # ── on_probe: fires every cycle ───────────────────────────────────
+            if on_probe is not None:
+                try:
+                    ret = on_probe(result, state)
+                    if asyncio.iscoroutine(ret):
+                        await ret
+                except Exception as exc:
+                    logger.warning("monitor on_probe callback raised: %s", exc)
+
+            # ── on_state_change: fires only on InfraState transitions ─────────
+            if state != prev_state and on_state_change is not None:
+                try:
+                    ret = on_state_change(prev_state, state)
+                    if asyncio.iscoroutine(ret):
+                        await ret
+                except Exception as exc:
+                    logger.warning("monitor on_state_change callback raised: %s", exc)
+
+            prev_state = state
+            iteration += 1
+
+            # ── Interval sleep — wakes early if stop_event is set ────────────
+            elapsed = time.perf_counter() - t_cycle_start
+            sleep_s = max(0.0, interval_s - elapsed)
+            try:
+                await asyncio.wait_for(_stop.wait(), timeout=sleep_s)
+                break   # stop_event fired during sleep → clean exit
+            except asyncio.TimeoutError:
+                pass    # normal path: interval elapsed, continue loop
+
+
+    async def tpot_probe(
+        self,
+        n_probes:   int           = 5,
+        prompt:     Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> dict:
+        """
+        Measure TPOT (Time Per Output Token = mean ITL) across n_probes requests.
+
+        TPOT isolates decode-phase throughput from queuing effects and is a
+        direct proxy for GPU memory bandwidth contention.  Under Fill & Squeeze
+        saturation it rises proportionally to KV cache occupancy because the
+        attention matmuls become increasingly memory-bound.
+        """
+        p = prompt     or self._PROMPTS["fixed_50"]
+        t = max_tokens or self.config.token_budget
+
+        results = []
+        for _ in range(n_probes):
+            results.append(await self._stream_probe(p, t, probe_type="tpot"))
+
+        good = [r for r in results if r.success and r.tpot_ms > 0]
+        if not good:
+            return {"success": False, "error": "no successful probes", "n": 0}
+
+        tpots        = [r.tpot_ms for r in good]
+        baseline_itl = max(self.config.baseline_itl_ms, 1e-6)
+        mean_tpot    = statistics.mean(tpots)
+        tpot_ratio   = mean_tpot / baseline_itl
+
+        return {
+            "success":         True,
+            "n":               len(good),
+            "mean_tpot_ms":    round(mean_tpot, 3),
+            "p95_tpot_ms":     round(sorted(tpots)[max(int(0.95 * len(tpots)) - 1, 0)], 3),
+            "tpot_stddev_ms":  round(statistics.stdev(tpots) if len(tpots) > 1 else 0.0, 3),
+            "tpot_ratio":      round(tpot_ratio, 3),
+            "baseline_itl_ms": round(baseline_itl, 3),
+            "degraded":        tpot_ratio > self.config.itl_fill_threshold,
+        }
+
+    async def request_timeout_probe(
+        self,
+        n_probes:     int           = 10,
+        hard_timeout: float         = 30.0,
+        prompt:       Optional[str] = None,
+        max_tokens:   int           = 100,
+    ) -> dict:
+        """
+        Detect whether the scheduler is actively aborting or partially serving
+        requests (HTTP 429, 503, mid-stream disconnect, partial response).
+
+        A high abort_rate confirms SATURATED / THRASHING state and that the
+        Fill phase has successfully exhausted available KV capacity.
+        """
+        p = prompt or self._PROMPTS["fixed_50"]
+
+        async def _one() -> tuple:
+            try:
+                r = await asyncio.wait_for(
+                    self._stream_probe(p, max_tokens, probe_type="abort_probe"),
+                    timeout=hard_timeout,
+                )
+                partial = r.success and r.tokens_out < max_tokens // 2
+                return r.success, r.tokens_out, ("partial" if partial else None)
+            except asyncio.TimeoutError:
+                return False, 0, "client_timeout"
+            except Exception as exc:
+                return False, 0, str(exc)
+
+        raw      = list(await asyncio.gather(*[_one() for _ in range(n_probes)]))
+        n_ok     = sum(1 for ok, _, __ in raw if ok)
+        n_part   = sum(1 for _, __, e  in raw if e == "partial")
+        n_fail   = n_probes - n_ok
+        errors   = [e for _, __, e in raw if e and e != "partial"]
+
+        return {
+            "n_probes":            n_probes,
+            "n_success":           n_ok,
+            "n_partial":           n_part,
+            "n_failed":            n_fail,
+            "abort_rate":          round(n_fail  / max(n_probes, 1), 4),
+            "partial_rate":        round(n_part  / max(n_probes, 1), 4),
+            "error_types":         list(set(errors)),
+            "scheduler_overloaded": (n_fail / max(n_probes, 1)) > 0.3,
+        }
+
+    async def adaptive_fill_signal(
+        self,
+        c_sat: float = 0.90,
+    ) -> dict:
+        """
+        Combined measurement + decision primitive for the Fill & Squeeze loop.
+
+            action = "fill"    → Δ_mem large; dispatch high-load requests
+            action = "squeeze" → Δ_mem ≈ 0;   dispatch long-output requests
+            action = "backoff" → Δ_mem < 0;   reduce request rate
+            action = "wait"    → baseline not calibrated or probe failed
+        """
+        result = await self.single_probe()
+        if not result.success or not self._baseline_calibrated:
+            return {
+                "action":       "wait",
+                "kv_usage_est": -1.0,
+                "delta_mem":    -1.0,
+                "state":        InfraState.UNKNOWN.value,
+                "probe":        result.to_dict(),
+            }
+
+        kv_est = result.kv_usage_est
+        delta  = c_sat - kv_est
+        state  = self.classify_state(probe=result)
+
+        if   state in (InfraState.THRASHING, InfraState.DEGRADED):
+            action = "backoff"
+        elif delta < 0:
+            action = "backoff"
+        elif delta < 0.05:
+            action = "squeeze"
+        elif state == InfraState.HOL_BLOCKED:
+            action = "squeeze"
+        else:
+            action = "fill"
+
+        return {
+            "action":       action,
+            "kv_usage_est": round(kv_est, 4),
+            "delta_mem":    round(delta, 4),
+            "c_sat":        c_sat,
+            "state":        state.value,
+            "probe":        result.to_dict(),
+        }
