@@ -76,7 +76,7 @@ local = TargetConfig(
     timeout=120.0,
 )
 
-TARGET = local  # ← switch to `local` for unlimited local testing
+TARGET = google_paid  # ← switch to `local` for unlimited local testing
 
 
 # ─────────────────────────────────────────────────────────────────────────────

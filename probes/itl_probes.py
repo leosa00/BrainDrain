@@ -827,16 +827,17 @@ class ITLProbes:
         long_p  = long_prompt  or self._PROMPTS["fixed_100"]
         short_p = short_prompt or self._PROMPTS["minimal"]
 
-        fill_tasks  = [
-            self._stream_probe(long_p, 150, probe_type="hol_fill")
+        fill_tasks = [
+            asyncio.create_task(
+                self._stream_probe(long_p, 150, probe_type="hol_fill")
+            )
             for _ in range(n_fill)
         ]
-        # Small stagger so fill requests enter the scheduler first
-        fill_coro   = asyncio.gather(*fill_tasks)
+        # Stagger works now: fill tasks are already running on the event loop
         await asyncio.sleep(0.05)
-        short_result, fill_results = await asyncio.gather(
+        short_result, *fill_results = await asyncio.gather(
             self._stream_probe(short_p, 5, probe_type="hol_short"),
-            fill_coro,
+            *fill_tasks,
         )
 
         baseline   = max(self.config.baseline_ttft_s, 1e-6)

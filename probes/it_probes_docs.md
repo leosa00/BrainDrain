@@ -44,7 +44,120 @@
    - [rolling_summary()](#rolling_summary)
 
 ---
+# Derived Latency Metrics — `ProbeResult`
 
+These fields are all `0.0` at construction time and populated by
+`compute_derived()` after a streaming probe completes. They are computed
+from `itl_values` — the list of raw inter-token gap timings (in seconds)
+recorded during the stream, converted to milliseconds.
+
+---
+
+## `mean_itl_ms` — Mean Inter-Token Latency
+
+**Formula:** `mean(itl_values × 1000)`
+
+The average time between consecutive token arrivals across the entire
+response. This is the primary KV cache pressure signal — as the KV pool
+fills up, attention computation becomes increasingly memory-bound, and
+each token takes longer to generate.
+
+**What it tells you:**
+- Near `baseline_itl_ms` → system is idle, KV pool has free capacity
+- 1.5× baseline → KV pool is filling (`FILLING` state)
+- 3× baseline → KV near saturation (`SATURATED` state)
+
+**Limitation on hosted APIs (Gemini, OpenAI):** Because multiple tokens
+are batched into a single SSE chunk, `mean_itl_ms` is actually the mean
+**inter-chunk** latency, not true per-token latency. The signal still
+correlates with load, but the absolute value is not comparable to vLLM
+where each chunk = 1 token.
+
+---
+
+## `p95_itl_ms` — 95th Percentile Inter-Token Latency
+
+**Formula:** `sorted(itl_values × 1000)[ceil(0.95 × n) - 1]`
+
+The ITL value below which 95% of all token gaps fall. Captures tail
+latency spikes that the mean would smooth over.
+
+**What it tells you:**
+- A large gap between `mean_itl_ms` and `p95_itl_ms` indicates
+  occasional stalls — for example, the scheduler briefly pausing to
+  allocate new KV blocks, or a batch boundary on the GPU
+- Under preemption, a single evicted-and-recomputed request will produce
+  one enormous ITL value that spikes `p95_itl_ms` far above the mean
+  while leaving `mean_itl_ms` relatively stable
+
+**Note on small n:** For a 4-token response, `p95 = ceil(3.8) - 1 = 3`,
+which is the last (maximum) value. With only 4 samples p95 and p99 are
+identical. This is expected and correct — with small n the highest sample
+IS the tail.
+
+---
+
+## `p99_itl_ms` — 99th Percentile Inter-Token Latency
+
+**Formula:** `sorted(itl_values × 1000)[ceil(0.99 × n) - 1]`
+
+The ITL value below which 99% of all token gaps fall. More sensitive than
+p95 to extreme outliers.
+
+**What it tells you:**
+- `p99_itl_ms` is almost always dominated by the **first** ITL value,
+  which equals TTFT (the gap from request start to first token). Since
+  TTFT includes prefill time and queue wait, it is always larger than
+  the decode-phase gaps that follow
+- For a response with 4 tokens, `p99 = ceil(3.96) - 1 = 3` — same index
+  as p95. They only diverge meaningfully when `n ≥ 20`
+- On vLLM under preemption, a sudden multi-second silence mid-stream
+  will show up here as a value orders of magnitude above `p95_itl_ms`
+
+---
+
+## `itl_stddev_ms` — Standard Deviation of ITL
+
+**Formula:** `stdev(itl_values × 1000)` (requires n ≥ 2, else 0.0)
+
+Measures how much individual token gaps vary around the mean.
+
+**What it tells you:**
+- **Low stddev** (< 20% of mean) → stable decode throughput, scheduler
+  is running smoothly
+- **High stddev** → erratic token delivery; possible causes:
+  - GPU batch boundaries (tokens arrive in bursts then pause)
+  - Scheduler preempting and resuming the request
+  - KV block allocation stalls between batches
+  - On hosted APIs: natural CDN routing variance
+
+**Role in `classify_state()`:** The rolling CoV (= stddev / mean)
+computed across `_itl_history` is the THRASHING detector. If
+`CoV > itl_cv_thrash_threshold` over the last N probes, the system is
+classified as `THRASHING` regardless of the absolute ITL level.
+
+---
+
+## `tpot_ms` — Time Per Output Token
+
+**Formula:** `mean_itl_ms` (they are set to the same value)
+
+TPOT is an alias for mean ITL that emphasises a different interpretation:
+where `mean_itl_ms` describes the side-channel signal, `tpot_ms` frames
+the same number as a **throughput metric** — how long the model takes to
+produce each output token on average.
+
+**Why the distinction matters:**
+- `tpot_ms` is used by `tpot_probe()`, which runs N sequential probes and
+  aggregates `tpot_ms` values across requests. This cross-request
+  aggregation isolates the decode phase from queuing effects (TTFT)
+- A rising `tpot_ms` trend across sequential probes is a direct signal of
+  GPU memory bandwidth saturation — attention matmuls are O(sequence_length)
+  in memory reads, so as KV tensors grow, each token costs more bandwidth
+- `tpot_ratio = mean_tpot / baseline_itl` > `itl_fill_threshold` triggers
+  `degraded: True` in the `tpot_probe()` result
+
+**Relationship to TTFT:**
 ## Data Classes
 
 ### `ProbeResult`
