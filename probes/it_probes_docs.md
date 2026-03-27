@@ -387,12 +387,6 @@ without ever snapping to it:
 | 4× baseline | 0.75 |
 | → ∞ | → 1.00 |
 
-> **Why soft sigmoid instead of hard clip?**
-> The old formula `clip(raw, 0, 1)` snapped to `1.0` any time ITL exceeded
-> 2× baseline, making the output binary on hosted APIs with natural
-> latency variance. The sigmoid preserves proportional information across
-> the full pressure range.
-
 ---
 
 ## `ITLProbes` — Infrastructure Methods
@@ -418,9 +412,6 @@ Constructs the full JSON request body for whichever API format is configured.
 | OpenAI / CUSTOM | `messages`, `max_tokens`, optionally `stream_options` |
 | Anthropic | `messages`, `max_tokens` |
 | Ollama | `messages`, `options.num_predict`, `options.temperature` |
-
-`probe_extra_body` is merged last, so it can override any field (e.g. inject
-`{"thinking": {"type": "disabled"}}` for Gemini).
 
 ---
 
