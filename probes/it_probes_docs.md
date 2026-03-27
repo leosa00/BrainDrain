@@ -90,11 +90,6 @@ latency spikes that the mean would smooth over.
   one enormous ITL value that spikes `p95_itl_ms` far above the mean
   while leaving `mean_itl_ms` relatively stable
 
-**Note on small n:** For a 4-token response, `p95 = ceil(3.8) - 1 = 3`,
-which is the last (maximum) value. With only 4 samples p95 and p99 are
-identical. This is expected and correct — with small n the highest sample
-IS the tail.
-
 ---
 
 ## `p99_itl_ms` — 99th Percentile Inter-Token Latency
@@ -157,7 +152,117 @@ produce each output token on average.
 - `tpot_ratio = mean_tpot / baseline_itl` > `itl_fill_threshold` triggers
   `degraded: True` in the `tpot_probe()` result
 
-**Relationship to TTFT:**
+---
+
+## `tokens_out` — Output Token Count
+
+**Formula:**
+```python
+if n > 1 and len(raw_text.split()) > n:
+    tokens_out = len(raw_text.split())   # hosted API — chunks batch multiple tokens
+else:
+    tokens_out = n                        # vLLM / Ollama — one token per chunk
+```
+
+The number of tokens (or chunks) received during the stream. The value means
+different things depending on the backend:
+
+| Backend | Chunk granularity | `tokens_out` accuracy |
+|---|---|---|
+| vLLM (local) | 1 token per SSE chunk | Exact token count |
+| Ollama | 1 token per NDJSON line | Exact token count |
+| Gemini / OpenAI hosted | Many tokens per chunk | Word-split estimate (undercount) |
+
+**Why it matters for ITL interpretation:** On hosted APIs where
+`tokens_out = 4` but `raw_text` contains 60+ words, the 4 `itl_values`
+entries are **inter-chunk** gaps, not per-token gaps. The absolute ITL
+values are larger than true per-token ITL, and the statistical metrics
+(`mean_itl_ms`, `p95_itl_ms`) reflect chunk delivery cadence rather than
+decode speed. On vLLM, `tokens_out` and `len(itl_values)` are equal and
+both reflect true token-level timing.
+
+**Note:** `len(raw_text.split())` is a whitespace word-count estimate, not
+a BPE token count. Markdown formatting like `**Mercury**` counts as one
+word but may be 3–4 BPE tokens. The true token count is only available if
+the endpoint returns a `usage.completion_tokens` field in the final stream
+chunk (requires `stream_options: {include_usage: true}`).
+
+---
+
+## `kv_usage_est` — KV Cache Utilisation Estimate
+
+**Type:** `float`, range `[0.0, 1.0]`, sentinel value `-1.0`
+
+An estimate of the current global GPU KV cache occupancy, Û_sys, derived
+from the ITL values of this probe via `KVUsageEstimator.estimate()`.
+
+**Sentinel value `-1.0`** means the estimate has not been computed yet.
+This happens in two cases:
+- The probe failed (`success = False`)
+- The probe type deliberately skips estimation (e.g. `ttft_probe()` which
+  produces only 1 ITL value — the TTFT itself — which is not a meaningful
+  KV pressure signal)
+
+**How it is populated:** `single_probe()` calls
+`estimator.estimate(itl_values × 1000)` and writes the result back into
+`result.kv_usage_est` after `_stream_probe()` returns. The raw
+`_stream_probe()` method itself always leaves `kv_usage_est = -1.0` —
+estimation is the responsibility of the caller.
+
+**Interpretation:**
+
+| Value | Meaning |
+|---|---|
+| `-1.0` | Not estimated (probe type skips it, or probe failed) |
+| `0.0` | ITL at or below baseline — KV pool has free capacity |
+| `0.0 – 0.5` | Moderate pressure — KV filling but not critical |
+| `0.5 – 0.8` | High pressure — Fill phase active |
+| `> 0.8` | Near saturation — Squeeze phase should begin |
+
+**Important caveat:** Without supervised training via `estimator.fit()`,
+the value comes from the unsupervised soft sigmoid fallback. On idle
+systems or hosted APIs with natural latency variation, this can return
+`0.0` even under real load if the current probe's ITL happens to be at or
+below the calibrated baseline. Always interpret trends across multiple
+probes rather than trusting a single reading.
+
+---
+
+## `success` — Probe Success Flag
+
+**Type:** `bool`, default `True`
+
+`True` if the HTTP request completed without error and at least the
+response headers were received successfully (status < 400).
+
+**Set to `False` when:**
+- HTTP status ≥ 400 (e.g. `429 Too Many Requests`, `503 Service Unavailable`)
+- `asyncio.TimeoutError` — the request exceeded `TargetConfig.timeout`
+- `aiohttp.ClientError` — network-level failure (connection refused, DNS
+  failure, TLS error)
+- RPD budget exhausted (set by `RateLimitedITLProbes` before the request fires)
+
+**Note:** `success = True` does not mean the response was useful. A probe
+can succeed but return `tokens_out = 0` and `raw_text = ""` if the model
+hit `max_tokens` during the reasoning phase (DeepSeek-R1 thinking tokens)
+before producing any visible output.
+
+---
+
+## `error` — Error Description
+
+**Type:** `Optional[str]`, default `None`
+
+Human-readable error string when `success = False`, otherwise `None`.
+
+**Common values:**
+
+| Value | Cause |
+|---|---|
+| `"timeout"` | `asyncio.TimeoutError` — request exceeded `TargetConfig.timeout` |
+| `"HTTP 429: ..."` | Rate limit hit — `RateLimitedITLProbes` will retry with back-off |
+| `"HTTP 503: ..."` | Server 
+
 ## Data Classes
 
 ### `ProbeResult`
