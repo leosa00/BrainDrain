@@ -44,7 +44,7 @@
    - [rolling_summary()](#rolling_summary)
 
 ---
-# Derived Latency Metrics — `ProbeResult`
+## Derived Latency Metrics — `ProbeResult`
 
 These fields are all `0.0` at construction time and populated by
 `compute_derived()` after a streaming probe completes. They are computed
