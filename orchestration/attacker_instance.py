@@ -64,6 +64,7 @@ class AttackerInstance:
         self._failures: int = 0
         self._timeouts: int = 0
         self._current_attack: Optional[BaseAttack] = None
+        self._dynamic_delay_s: float = 0.0
 
     # ── Core execution ────────────────────────────────────────────────────
 
@@ -117,7 +118,10 @@ class AttackerInstance:
         else:
             self._failures += 1
 
-        await attack.close()
+        try:
+            await attack.close()
+        except Exception as exc:
+            logger.warning("[%s] attack.close() raised: %s", self.instance_id, exc)
         self._current_attack = None
         return result
 
@@ -134,10 +138,12 @@ class AttackerInstance:
         replaces the completing one before the scheduler can free
         blocks to legitimate traffic.
 
-        inter_request_delay_s can introduce a small gap between
-        requests if needed (e.g. to avoid self-preemption during
-        the THRASHING backoff phase).
+        inter_request_delay_s sets the initial delay between requests.
+        Can be adjusted at runtime via set_inter_request_delay() (e.g.
+        during the THRASHING backoff phase).
         """
+        self._dynamic_delay_s = inter_request_delay_s
+
         if self.cfg.launch_delay_s > 0:
             await asyncio.sleep(self.cfg.launch_delay_s)
 
@@ -146,8 +152,8 @@ class AttackerInstance:
                 result = await self.run_once()
                 await result_queue.put(result)
 
-                if inter_request_delay_s > 0 and not stop_event.is_set():
-                    await asyncio.sleep(inter_request_delay_s)
+                if self._dynamic_delay_s > 0 and not stop_event.is_set():
+                    await asyncio.sleep(self._dynamic_delay_s)
 
             except asyncio.CancelledError:
                 raise

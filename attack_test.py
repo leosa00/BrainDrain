@@ -24,7 +24,7 @@ rb_config = ReasoningBombConfig(
 
 instance_cfg = AttackerInstanceConfig(
     attack_cls=ReasoningBombAttack,
-    attack_config_factory=make_config_factory(target, max_tokens=30000),
+    attack_config_factory=make_config_factory(target, max_tokens=2000),
     attack_extra_kwargs={"rb_config": rb_config},
 )
 
