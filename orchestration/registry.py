@@ -10,11 +10,12 @@ from typing import Callable, Optional, Type
 
 from core.base_attack import AttackConfig, BaseAttack, TargetConfig
 from attacks.reasoning_bomb import ReasoningBombAttack, ReasoningBombConfig
+from attacks.think_trap import ThinkTrapAttack, ThinkTrapConfig
 
 ATTACK_REGISTRY: dict[str, Type[BaseAttack]] = {
     "reasoning_bomb": ReasoningBombAttack,
+    "think_trap":     ThinkTrapAttack,
     # "fill_squeeze":   FillSqueezeAttack,    # TODO
-    # "think_trap":     ThinkTrapAttack,      # TODO
 }
 
 
