@@ -67,6 +67,13 @@ google_paid = TargetConfig(
     supports_stream_options=True,
 )
 
+runpod_vllm = TargetConfig(
+    base_url="https://wxjz5hyynv2a6n-8000.proxy.runpod.net",
+    model="deepseek-r1-7b",           # must match --served-model-name
+    api_format=APIFormat.CUSTOM,       # vLLM is OpenAI-compatible
+    api_key=secret.runpod_api_key,
+    timeout=600.0,
+)
 
 local = TargetConfig(
     base_url="http://localhost:11434",
@@ -76,7 +83,7 @@ local = TargetConfig(
     timeout=120.0,
 )
 
-TARGET = google_paid  # ← switch to `local` for unlimited local testing
+TARGET = runpod_vllm  # ← switch to `local` for unlimited local testing
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -659,7 +666,7 @@ async def main(suite_name: str, rpm: float, burst_size: int,daily_budget: int,ab
         # are not wasted on reasoning — probes need fast, cheap responses
         #probe_extra_body={"thinking": {"type": "disabled"}},
     )
-    probes = RateLimitedITLProbes(cfg_free, limiter, rpd)
+    probes = RateLimitedITLProbes(cfg, limiter, rpd)
 
     try:
         if suite_name == "all":

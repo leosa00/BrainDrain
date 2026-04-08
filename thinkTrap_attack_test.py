@@ -1,7 +1,7 @@
 import asyncio
 import random
 from core.base_attack import TargetConfig, APIFormat
-from attacks.reasoning_bomb import ReasoningBombAttack, ReasoningBombConfig, PuzzleLoader
+from attacks.think_trap import ThinkTrapAttack, ThinkTrapConfig, ThinkTrapPromptCache
 from orchestration.attacker_instance import AttackerInstance, AttackerInstanceConfig
 from orchestration.result_collector import ResultCollector
 from orchestration.registry import make_config_factory
@@ -11,8 +11,8 @@ google_paid = TargetConfig(
     base_url="https://generativelanguage.googleapis.com/v1beta/openai",
     model="gemini-2.5-flash",
     api_format=APIFormat.CUSTOM,
-    api_key=secret.google_api_paid,   # same AIza... key, billing just needs to
-    timeout=300.0,                    # be enabled in GCP console for this project
+    api_key=secret.google_api_paid,
+    timeout=300.0,
     supports_stream_options=True,
 )
 
@@ -25,34 +25,39 @@ runpod_vllm = TargetConfig(
 )
 target = runpod_vllm
 
+N_INSTANCES = 1
 
-N_INSTANCES = 9
+# Must match a file produced by thinkTrap_test.py.  Choose one of: 20, 40, 60, 80.
+P_LENGTH    = 20
+PROMPT_FILE = f"prompts/thinktrap_prompts_{P_LENGTH}.json"
 
-PUZZLE_FILE = "prompts/reasoningBomb_puzzles.json"
-BUDGET_TIER = "256"
-
-# Pre-select a distinct random puzzle index for each instance so that
-# concurrent requests never share a prompt and bypass vLLM's prefix cache.
-_loader    = PuzzleLoader(PUZZLE_FILE)
-_pool_size = _loader.count(BUDGET_TIER)
+# Pre-select distinct random prompt indices so concurrent requests never share
+# a prompt and bypass vLLM's prefix cache.
+_cache     = ThinkTrapPromptCache(PROMPT_FILE)
+_pool_size = _cache.count()
 _indices   = random.sample(range(_pool_size), min(N_INSTANCES, _pool_size))
-# If N_INSTANCES exceeds pool size, wrap around (still shuffled)
 while len(_indices) < N_INSTANCES:
     _indices.extend(random.sample(range(_pool_size), min(_pool_size, N_INSTANCES - len(_indices))))
+
 
 async def smoke_test():
     queue     = asyncio.Queue()
     stop      = asyncio.Event()
     collector = ResultCollector()
 
+    print(f"\n=== Prompts being sent (from {PROMPT_FILE}) ===")
+    for i, idx in enumerate(_indices):
+        entry = _cache.get(idx)
+        print(f"  [{i}] index={idx}  score={entry.get('score')}  text={entry.get('text', '')!r}")
+    print("=" * 52 + "\n")
+
     instances = [
         AttackerInstance(AttackerInstanceConfig(
-            attack_cls=ReasoningBombAttack,
+            attack_cls=ThinkTrapAttack,
             attack_config_factory=make_config_factory(target, max_tokens=16000),
-            attack_extra_kwargs={"rb_config": ReasoningBombConfig(
-                puzzle_file=PUZZLE_FILE,
-                budget_tier=BUDGET_TIER,
-                puzzle_index=_indices[i],
+            attack_extra_kwargs={"tt_config": ThinkTrapConfig(
+                prompts_file=PROMPT_FILE,
+                prompt_index=_indices[i],
             )},
         ))
         for i in range(N_INSTANCES)
@@ -68,5 +73,6 @@ async def smoke_test():
 
     run_result = collector.finalise(instance_stats=[inst.stats for inst in instances])
     print(run_result.summary())
+
 
 asyncio.run(smoke_test())

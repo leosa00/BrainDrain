@@ -332,6 +332,11 @@ class BaseAttack(ABC):
 
 
         result.latency_metrics.total_duration_s = time.perf_counter() - t_start
+        if t_first_token is not None:
+            result.latency_metrics.ttft_s = t_first_token - t_start
+        # Fallback: if the usage chunk wasn't sent, count ITL entries as tokens
+        if result.token_metrics.completion_tokens == 0:
+            result.token_metrics.completion_tokens = len(result.latency_metrics.inter_token_latencies)
         result.raw_response = "".join(full_text)
         result.status       = AttackStatus.SUCCESS
         return result

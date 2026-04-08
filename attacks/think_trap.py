@@ -268,6 +268,7 @@ def decode_embeddings_to_tokens(
 def load_surrogate_embeddings(
     model_name: str,
     embeddings_path: Optional[str] = None,
+    hf_token: Optional[str] = None,
 ) -> Tuple[np.ndarray, Any]:
     """
     Load the input token embedding matrix from a surrogate LLM.
@@ -311,13 +312,14 @@ def load_surrogate_embeddings(
         ) from exc
 
     log.info("Loading surrogate model %r …", model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
     # float16 halves peak RAM (e.g. LLaMA-2-7B: 28 GB → 14 GB).
     # We only need the embedding matrix, so the model is freed immediately after.
     model = AutoModel.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
+        token=hf_token,
     )
     model.eval()
 
@@ -398,7 +400,7 @@ def make_victim_fn(
                 or 0
             )
         except Exception as exc:
-            log.debug("victim_fn error: %s", exc)
+            log.warning("victim_fn error: %s", exc, exc_info=True)
             return 0
 
     return _victim
@@ -738,17 +740,16 @@ class ThinkTrapAttack(BaseAttack):
     def _parse_openai_chunk(
         self, data: dict, result: AttackResult
     ) -> Optional[str]:
-        # Final usage-only chunk (stream_options.include_usage=True)
-        if "usage" in data and data.get("choices") is None:
-            usage = data["usage"]
-            result.token_metrics.prompt_tokens     = usage.get("prompt_tokens", 0)
-            result.token_metrics.completion_tokens = usage.get("completion_tokens", 0)
-            details = usage.get("completion_tokens_details", {})
-            result.token_metrics.reasoning_tokens  = details.get("reasoning_tokens", 0)
-            return None
+        choices = data.get("choices") or []
 
-        choices = data.get("choices", [])
+        # Final usage chunk — choices is absent or empty
         if not choices:
+            if "usage" in data:
+                usage = data["usage"]
+                result.token_metrics.prompt_tokens     = usage.get("prompt_tokens", 0)
+                result.token_metrics.completion_tokens = usage.get("completion_tokens", 0)
+                details = usage.get("completion_tokens_details", {})
+                result.token_metrics.reasoning_tokens  = details.get("reasoning_tokens", 0)
             return None
         delta = choices[0].get("delta", {})
 

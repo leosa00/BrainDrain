@@ -450,7 +450,16 @@ class ITLProbes:
             if not choices:
                 return None
             delta = choices[0].get("delta", {})
-            return delta.get("content") or delta.get("reasoning_content")
+            # Use explicit None-checks instead of truthiness so that empty-string
+            # content tokens (common in vLLM streaming for thinking models like
+            # DeepSeek-R1) still register as chunk events for ITL timing.
+            content   = delta.get("content")
+            reasoning = delta.get("reasoning_content")
+            if content is not None:
+                return content    # may be "" — still a decoded chunk worth timing
+            if reasoning is not None:
+                return reasoning  # thinking-phase tokens on vLLM w/ separate field
+            return None
 
         elif fmt == APIFormat.ANTHROPIC:
             if data.get("type") == "content_block_delta":

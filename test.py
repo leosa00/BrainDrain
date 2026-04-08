@@ -7,7 +7,7 @@ google = TargetConfig(
     base_url="https://generativelanguage.googleapis.com/v1beta/openai",
     model="gemini-2.5-flash",
     api_format=APIFormat.CUSTOM,
-    api_key=secret.google_api,
+    api_key=secret.google_api_paid, 
 )
 
 local = TargetConfig(
@@ -18,12 +18,20 @@ local = TargetConfig(
         timeout=600.0,
     )
 
+runpod_vllm = TargetConfig(
+    base_url="https://wxjz5hyynv2a6n-8000.proxy.runpod.net",
+    model="deepseek-r1-7b",           # must match --served-model-name
+    api_format=APIFormat.CUSTOM,       # vLLM is OpenAI-compatible
+    api_key=secret.runpod_api_key,
+    timeout=600.0,
+)
+
 async def main():
-    target = local
+    target = runpod_vllm
 
     config = AttackConfig(
         target=target,
-        max_tokens=4096,
+        max_tokens=10000,
         stream=True,
     )
     rb_cfg = ReasoningBombConfig(
