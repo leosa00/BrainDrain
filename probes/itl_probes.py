@@ -1,43 +1,42 @@
 """
 probes/itl_probes.py — Black-box ITL side-channel probing for LLM serving infra.
 
-Implements all probing mechanisms from:
-  "Rethinking Latency Denial-of-Service: Attacking the LLM Serving Framework,
-   Not the Model" (Wang et al., 2026) — Fill & Squeeze paper.
+Measures server degradation as a black-box side-channel alongside attack
+workloads. ITL (inter-token latency) correlates with GPU KV-cache utilisation
+due to memory bandwidth contention, making it a useful proxy for real-time
+scheduler state without privileged access.
 
-Core insight (§5.2.2): ITL of standard requests correlates linearly with
-global GPU KV-cache usage due to physical memory bandwidth contention.
-This makes ITL a black-box side-channel for estimating real-time scheduler
-state without privileged access, enabling adaptive Fill & Squeeze control.
-
-Probe taxonomy:
-  1.  single_probe()          — core ITL + TTFT one-shot measurement
-  2.  burst_probe()           — N concurrent probes (queue depth, variance)
-  3.  ttft_probe()            — TTFT-only fast probe (WAITING queue indicator)
-  4.  calibrate_baseline()    — establish idle-state reference metrics
-  5.  preemption_probe()      — long-running probe detecting intra-request spikes
-  6.  hol_probe()             — Head-of-Line blocking detection via TTFT divergence
-  7.  memory_pressure_scan()  — sequential ITL time-series (maps Fill ramp)
-  8.  estimate_kv_usage()     — live Û_sys ∈ [0, 1] for adaptive control loop
-  9.  classify_state()        — InfraState classifier from probe + rolling history
-  10. monitor()               — continuous async polling loop with callbacks
+Probe API:
+  calibrate_baseline()    — establish idle-state reference metrics
+  single_probe()          — core ITL + TTFT one-shot measurement
+  burst_probe()           — N concurrent probes (queue depth / variance)
+  ttft_probe()            — TTFT-only fast probe (queue wait indicator)
+  preemption_probe()      — long-running probe detecting intra-request spikes
+  memory_pressure_scan()  — sequential ITL time-series
+  tpot_probe()            — Time-Per-Output-Token across N requests
+  request_timeout_probe() — failure rate under load
+  estimate_kv_usage()     — live KV cache pressure estimate ∈ [0, 1]
+  classify_state()        — InfraState classifier from probe + rolling history
+  rolling_summary()       — aggregate stats over recent probe window
+  monitor()               — continuous async polling loop with callbacks
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
+import math
 import statistics
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Deque, List, Optional
 
-
-import math
 import aiohttp
 import numpy as np
 
@@ -82,7 +81,7 @@ class ProbeResult:
     probe_id:      str   = field(default_factory=lambda: str(uuid.uuid4())[:8])
     timestamp:     float = field(default_factory=time.time)
     probe_type:    str   = "unknown"
-    raw_text: str = ""
+    raw_text:      str   = ""
 
     # Core latency
     ttft_s:        float       = 0.0
@@ -97,29 +96,26 @@ class ProbeResult:
     tpot_ms:       float = 0.0
     tokens_out:    int   = 0
 
-    # KV estimate [-1 = not yet estimated]
+    # KV estimate [-1 = not estimated]
     kv_usage_est:  float = -1.0
 
-    success:       bool            = True
-    error:         Optional[str]   = None
+    success:       bool          = True
+    error:         Optional[str] = None
 
     def compute_derived(self) -> None:
         if not self.itl_values:
             return
         ms = [v * 1000.0 for v in self.itl_values]
         n  = len(ms)
-        self.chunk_count    = n
+        self.chunk_count = n
         if n > 1 and len(self.raw_text.split()) > n:
-            # Hosted API — chunks contain multiple tokens, use word estimate
             self.tokens_out = len(self.raw_text.split())
         else:
-            # vLLM / Ollama — one token per chunk, chunk count is accurate
             self.tokens_out = n
         self.mean_itl_ms   = statistics.mean(ms)
         self.tpot_ms       = self.mean_itl_ms
         self.itl_stddev_ms = statistics.stdev(ms) if n > 1 else 0.0
         s = sorted(ms)
-        # correct: clamp to [0, n-1], never subtract 1 before clamping
         self.p95_itl_ms = s[min(int(math.ceil(0.95 * n)) - 1, n - 1)]
         self.p99_itl_ms = s[min(int(math.ceil(0.99 * n)) - 1, n - 1)]
 
@@ -144,9 +140,9 @@ class ProbeResult:
 
 @dataclass
 class BurstProbeResult:
-    timestamp:      float            = field(default_factory=time.time)
-    n_probes:       int              = 0
-    n_success:      int              = 0
+    timestamp:      float             = field(default_factory=time.time)
+    n_probes:       int               = 0
+    n_success:      int               = 0
     individual:     List[ProbeResult] = field(default_factory=list)
 
     mean_ttft_s:    float = 0.0
@@ -164,7 +160,7 @@ class BurstProbeResult:
             return
 
         ttfts = sorted([r.ttft_s      for r in good])
-        itls  = sorted([r.mean_itl_ms for r in good if r.mean_itl_ms > 0])  # exclude zero-token probes
+        itls  = sorted([r.mean_itl_ms for r in good if r.mean_itl_ms > 0])
         n_t   = len(ttfts)
         n_i   = len(itls)
 
@@ -173,11 +169,6 @@ class BurstProbeResult:
         self.mean_itl_ms   = statistics.mean(itls)   if itls else 0.0
         self.itl_stddev_ms = statistics.stdev(itls)  if n_i > 1 else 0.0
 
-        # ── OLD (floor − 1 picks median for small n) ──────────────────────
-        # self.p95_ttft_s = st[max(int(0.95 * n) - 1, 0)]
-        # self.p95_itl_ms = si[max(int(0.95 * n) - 1, 0)]
-
-        # ── NEW (ceil then clamp — always picks the highest sample for n<20)
         if n_t > 0:
             self.p95_ttft_s = ttfts[min(int(math.ceil(0.95 * n_t)) - 1, n_t - 1)]
         if n_i > 0:
@@ -200,6 +191,7 @@ class BurstProbeResult:
             "kv_usage_est":  round(self.kv_usage_est, 4),
         }
 
+
 # ─────────────────────────────────────────────
 # Probe Config
 # ─────────────────────────────────────────────
@@ -208,12 +200,13 @@ class BurstProbeResult:
 class ProbeConfig:
     target: TargetConfig
 
-    # Probe request sizing (keep minimal to avoid self-inflicted load)
-    token_budget:        int   = 512    # max_tokens for standard probe
+    # Probe request sizing (keep small to avoid adding to server load)
+    max_probe_tokens:    int   = 512
     temperature:         float = 0.0
+    probe_timeout_s:     float = 30.0  # per-probe hard deadline (HOL blocking guard)
 
     # Baseline calibration
-    baseline_window:     int   = 5      # cold probes for baseline
+    baseline_window:     int   = 5
     baseline_itl_ms:     float = 0.0   # populated after calibrate_baseline()
     baseline_ttft_s:     float = 0.0
 
@@ -233,25 +226,36 @@ class ProbeConfig:
     regressor_backend:   str  = "linear"
     probe_extra_body:    dict = field(default_factory=dict)
 
+    # Path to persist baseline calibration across runs (None = no persistence)
+    baseline_cache_path: Optional[str] = None
+
+    # Path to a JSONL file for persistent probe history (None = no persistence).
+    # Each successful single_probe() result is appended as one JSON line.
+    # On startup the last `rolling_window` entries are loaded into _itl_history
+    # so rolling_summary() and classify_state() work across sessions.
+    history_path: Optional[str] = None
+
+
 # ─────────────────────────────────────────────
 # KV Usage Estimator
 # ─────────────────────────────────────────────
 
 class KVUsageEstimator:
     """
-    Lightweight regressor: ITL feature vector → Û_sys ∈ [0, 1].
+    Regressor: ITL feature vector → Û_sys ∈ [0, 1].
 
-    From Fill & Squeeze §5.2.2: ITL correlates strongly with global GPU
-    memory usage due to physical memory bandwidth contention, enabling a
-    black-box KV cache utilisation estimate without privileged access.
+    ITL correlates with GPU KV cache utilisation due to memory bandwidth
+    contention, enabling a black-box pressure estimate.
 
     Backends:
       "lightgbm" — LGBMRegressor (requires supervised training data)
       "linear"   — Ridge regression (requires supervised training data)
       "none"     — unsupervised relative-pressure fallback (always available)
 
-    Unsupervised fallback (black-box default):
-        Û_sys = clip((mean_ITL - baseline_ITL) / baseline_ITL, 0, 1)
+    For supervised training, call fit() with (ITL_sequences, kv_usages) pairs
+    collected from a calibration phase where vLLM /metrics is readable.
+    Until fit() is called, estimate() uses the unsupervised fallback:
+        Û_sys = clip((mean_ITL − baseline_ITL) / baseline_ITL, 0, 1)
     """
 
     def __init__(self, backend: str = "linear") -> None:
@@ -261,14 +265,9 @@ class KVUsageEstimator:
         self._baseline_itl_ms: float = 0.0
         self._trained: bool = False
 
-    # ── Feature engineering ───────────────────────────────────────────────────
-
     @staticmethod
     def extract_features(itl_ms: List[float]) -> np.ndarray:
-        """
-        Fixed-length 11-dim feature vector from variable-length ITL sequence.
-        [mean, std, p50, p75, p90, p95, p99, min, max, linear_slope, CoV]
-        """
+        """11-dim feature vector from a variable-length ITL sequence."""
         if not itl_ms:
             return np.zeros(11)
         a = np.asarray(itl_ms, dtype=float)
@@ -288,17 +287,16 @@ class KVUsageEstimator:
             cov,
         ])
 
-    # ── Supervised training (optional, requires ground-truth labels) ──────────
-
     def fit(
         self,
         itl_sequences: List[List[float]],  # list of ITL-ms sequences
         kv_usages:     List[float],         # ground-truth Û_sys ∈ [0, 1]
     ) -> None:
         """
-        Train the regressor on (ITL_sequence, kv_usage) pairs.
-        Obtain ground-truth labels from privileged vLLM /metrics endpoint
-        during a controlled calibration phase (white-box pre-training).
+        Train on (ITL_sequence, kv_usage) pairs.
+
+        Ground-truth labels come from vLLM's /metrics endpoint
+        (vllm:gpu_cache_usage_perc) during a controlled calibration phase.
         """
         X = np.array([self.extract_features(seq) for seq in itl_sequences])
         y = np.asarray(kv_usages, dtype=float)
@@ -326,10 +324,8 @@ class KVUsageEstimator:
     def set_baseline(self, baseline_itl_ms: float) -> None:
         self._baseline_itl_ms = max(baseline_itl_ms, 1e-6)
 
-    # ── Inference ─────────────────────────────────────────────────────────────
-
     def estimate(self, itl_ms: List[float]) -> float:
-        """Return Û_sys ∈ [0.0, 1.0]. Uses model if trained, else fallback."""
+        """Return Û_sys ∈ [0.0, 1.0]. Uses trained model if available, else fallback."""
         if not itl_ms:
             return 0.0
 
@@ -339,14 +335,14 @@ class KVUsageEstimator:
                 feats = self._scaler.transform(feats)
             return float(np.clip(self._model.predict(feats)[0], 0.0, 1.0))
 
-        # Unsupervised: relative ITL pressure over calibrated baseline
+        # Unsupervised fallback: relative ITL pressure over calibrated baseline
         mean_itl = float(np.mean(itl_ms))
         if self._baseline_itl_ms <= 0:
             return 0.0
-
-        raw = (mean_itl - self._baseline_itl_ms) / self._baseline_itl_ms
+        raw  = (mean_itl - self._baseline_itl_ms) / self._baseline_itl_ms
         soft = raw / (1.0 + abs(raw))
         return float(np.clip(soft, 0.0, 1.0))
+
 
 # ─────────────────────────────────────────────
 # Core Probe Engine
@@ -354,19 +350,58 @@ class KVUsageEstimator:
 
 class ITLProbes:
     """
-    Black-box side-channel probing suite for LLM serving infrastructure.
+    Black-box ITL probing suite for measuring LLM server degradation.
 
-    Designed to feed the Fill & Squeeze adaptive control loop:
-        Δ_mem = C_sat − estimate_kv_usage()
-        Δ_mem large  →  dispatch P_High (Fill phase)
-        Δ_mem → 0    →  dispatch P_Low  (Squeeze phase)
-        Δ_mem < 0    →  back-off (avoid self-preemption)
+    Intended to run alongside attack workloads to measure their effectiveness
+    in real-time via ITL side-channel, without any privileged server access.
 
-    All probes are payload-agnostic and work in pure black-box settings
-    against any OpenAI-compatible, Anthropic, or Ollama endpoint.
+    Typical usage:
+        probes = ITLProbes(ProbeConfig(target=my_target))
+        await probes.calibrate_baseline()
+
+        stop = asyncio.Event()
+        monitor_task = asyncio.create_task(probes.monitor(
+            interval_s=3.0,
+            on_probe=lambda r, s: print(r.mean_itl_ms, s.value),
+            stop_event=stop,
+        ))
+        # ... run attack ...
+        stop.set()
+        await monitor_task
+        print(probes.rolling_summary())
     """
 
-    # Deliberately innocuous probe prompts — blend with organic traffic
+    # Long context used by load_balancer_probe. Placed after a unique UUID prefix
+    # so each pair has a unique full prompt (no cross-pair APC pollution) while
+    # still being long enough that prefill takes ~100-200 ms on a 7B model,
+    # making cache hits clearly visible as a TTFT drop.
+    _LB_CONTEXT: str = (
+        "The following is a technical overview of distributed systems and GPU computing. "
+        "Modern computing relies on hierarchical memory: L1 cache (4-5 cycles), L2 (12-15 cycles), "
+        "L3 (40-60 cycles), and DRAM (200+ cycles). Cache coherence protocols keep multi-core "
+        "state consistent. In distributed systems, the CAP theorem states that consistency, "
+        "availability, and partition tolerance cannot all be guaranteed simultaneously. "
+        "Databases navigate this via eventual consistency, Raft/Paxos consensus, and MVCC. "
+        "Load balancers distribute traffic using round-robin, least-connections, or consistent "
+        "hashing. Consistent hashing maps servers and keys onto a ring, minimising reshuffling "
+        "during scale events. Session affinity pins a client to one backend, improving cache "
+        "locality but risking hot spots. CDNs use anycast and geographic routing to cut latency. "
+        "In GPU computing, the memory hierarchy spans registers, shared memory, L1/L2, and global "
+        "DRAM. Transformer attention is memory-bound: each forward pass reads the full KV cache "
+        "from DRAM, so bandwidth — not compute — is the bottleneck at long context lengths. "
+        "Automatic Prefix Caching (APC) in systems like vLLM reuses computed KV pairs for "
+        "identical prompt prefixes, skipping redundant prefill and reducing TTFT proportionally "
+        "to the cached prefix length. Block-level caching groups tokens into fixed-size blocks "
+        "and evicts via LRU under memory pressure. Speculative decoding uses a small draft model "
+        "to propose multiple tokens, which the target model verifies in parallel, increasing "
+        "throughput without changing output distribution. Continuous batching interleaves "
+        "prefill and decode phases across requests, keeping GPU utilisation high. PagedAttention "
+        "manages KV cache as virtual memory pages, eliminating fragmentation. Chunked prefill "
+        "splits long-context prefills into fixed-size chunks to bound scheduling latency. "
+        "These techniques together allow serving frameworks to sustain high throughput while "
+        "keeping per-request latency predictable under load."
+    )
+
     _PROMPTS: dict[str, str] = {
         "minimal":   "Reply with only the single word: ok",
         "short":     "Count from 1 to 10, each number on a new line.",
@@ -374,7 +409,6 @@ class ITLProbes:
         "fixed_50":  "Write a paragraph of at least 60 words about the ocean. Do not use bullet points.",
         "fixed_100": "Write two paragraphs totaling at least 120 words about climate change.",
         "repeat_50": "List every number from 1 to 50, each on its own line.",
-        "paragraph": "Write a paragraph of about 50 words on the weather.",
     }
 
     def __init__(self, config: ProbeConfig) -> None:
@@ -384,6 +418,100 @@ class ITLProbes:
         self._itl_history:   Deque[ProbeResult] = deque(maxlen=config.rolling_window)
         self._state_history: Deque[InfraState]  = deque(maxlen=50)
         self._baseline_calibrated = False
+
+        # Auto-load persisted baseline if a cache path is configured
+        if config.baseline_cache_path:
+            self._load_baseline(config.baseline_cache_path)
+
+        # Pre-populate rolling history from disk
+        if config.history_path:
+            self._load_history(config.history_path)
+
+    # ── Baseline persistence ──────────────────────────────────────────────────
+
+    def _save_baseline(self, path: str) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "baseline_itl_ms": self.config.baseline_itl_ms,
+            "baseline_ttft_s": self.config.baseline_ttft_s,
+            "target_url":      self.config.target.base_url,
+            "model":           self.config.target.model,
+            "saved_at":        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        p.write_text(json.dumps(data, indent=2))
+        logger.info("Baseline saved → %s", path)
+
+    def _load_baseline(self, path: str) -> bool:
+        """Load persisted baseline. Returns True if loaded successfully."""
+        p = Path(path)
+        if not p.exists():
+            return False
+        try:
+            data = json.loads(p.read_text())
+            self.config.baseline_itl_ms = float(data["baseline_itl_ms"])
+            self.config.baseline_ttft_s = float(data["baseline_ttft_s"])
+            self.estimator.set_baseline(self.config.baseline_itl_ms)
+            self._baseline_calibrated = True
+            logger.info(
+                "Baseline loaded from %s  (itl=%.3f ms, ttft=%.4f s, saved %s)",
+                path, self.config.baseline_itl_ms, self.config.baseline_ttft_s,
+                data.get("saved_at", "?"),
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Failed to load baseline from %s: %s", path, exc)
+            return False
+
+    # ── Probe history persistence ─────────────────────────────────────────────
+
+    def _append_history(self, result: ProbeResult) -> None:
+        """Append one probe result to the JSONL history file."""
+        path = self.config.history_path
+        if not path:
+            return
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as f:
+            f.write(json.dumps(result.to_dict()) + "\n")
+
+    def _load_history(self, path: str) -> None:
+        """Load last `rolling_window` entries from the JSONL history file."""
+        p = Path(path)
+        if not p.exists():
+            return
+        try:
+            lines = p.read_text().splitlines()
+            # Take the last rolling_window lines
+            recent = lines[-self.config.rolling_window:]
+            for line in recent:
+                if not line.strip():
+                    continue
+                d = json.loads(line)
+                r = ProbeResult(
+                    probe_id    = d.get("probe_id", ""),
+                    timestamp   = d.get("timestamp", 0.0),
+                    probe_type  = d.get("probe_type", "single"),
+                    ttft_s      = d.get("ttft_s", 0.0),
+                    total_s     = d.get("total_s", 0.0),
+                    mean_itl_ms = d.get("mean_itl_ms", 0.0),
+                    p95_itl_ms  = d.get("p95_itl_ms", 0.0),
+                    p99_itl_ms  = d.get("p99_itl_ms", 0.0),
+                    itl_stddev_ms = d.get("itl_stddev_ms", 0.0),
+                    tpot_ms     = d.get("tpot_ms", 0.0),
+                    tokens_out  = d.get("tokens_out", 0),
+                    kv_usage_est = d.get("kv_usage_est", -1.0),
+                    success     = d.get("success", True),
+                    error       = d.get("error"),
+                )
+                self._itl_history.append(r)
+            if self._itl_history:
+                logger.info(
+                    "Probe history loaded from %s  (%d entries)",
+                    path, len(self._itl_history),
+                )
+        except Exception as exc:
+            logger.warning("Failed to load probe history from %s: %s", path, exc)
 
     # ── HTTP session ──────────────────────────────────────────────────────────
 
@@ -416,7 +544,6 @@ class ITLProbes:
         if fmt in (APIFormat.OPENAI, APIFormat.CUSTOM, APIFormat.TEST):
             base["messages"]   = msgs
             base["max_tokens"] = max_tokens
-            # Only include if the endpoint explicitly supports it
             if stream and self.config.target.supports_stream_options:
                 base["stream_options"] = {"include_usage": True}
 
@@ -450,15 +577,12 @@ class ITLProbes:
             if not choices:
                 return None
             delta = choices[0].get("delta", {})
-            # Use explicit None-checks instead of truthiness so that empty-string
-            # content tokens (common in vLLM streaming for thinking models like
-            # DeepSeek-R1) still register as chunk events for ITL timing.
             content   = delta.get("content")
             reasoning = delta.get("reasoning_content")
             if content is not None:
-                return content    # may be "" — still a decoded chunk worth timing
+                return content
             if reasoning is not None:
-                return reasoning  # thinking-phase tokens on vLLM w/ separate field
+                return reasoning
             return None
 
         elif fmt == APIFormat.ANTHROPIC:
@@ -484,9 +608,9 @@ class ITLProbes:
         session = await self._get_session()
         t_start = time.perf_counter()
         t_last  = t_start
-        t_first: Optional[float] = None
 
-        try:
+        async def _do() -> None:
+            nonlocal t_last
             async with session.post(
                 self.config.target.endpoint,
                 json=payload,
@@ -495,7 +619,7 @@ class ITLProbes:
                 if resp.status >= 400:
                     result.success = False
                     result.error   = f"HTTP {resp.status}: {(await resp.text())[:200]}"
-                    return result
+                    return
 
                 buf  = b""
                 done = False
@@ -507,9 +631,6 @@ class ITLProbes:
                         line_b, buf = buf.split(b"\n", 1)
                         line = line_b.decode("utf-8", errors="replace").strip()
 
-                        # ── Ollama native NDJSON (no "data:" prefix) ─────────
-                        # APIFormat.OLLAMA sends raw JSON lines, not SSE.
-                        # CUSTOM/OPENAI pointing at Ollama's /v1 endpoint sends SSE.
                         if self.config.target.api_format == APIFormat.OLLAMA:
                             if not line:
                                 continue
@@ -526,15 +647,17 @@ class ITLProbes:
                         t_now = time.perf_counter()
                         token = self._extract_token(data_str)
                         if token is not None:
-                            if t_first is None:
-                                t_first       = t_now
+                            if not result.itl_values:
                                 result.ttft_s = t_now - t_start
                             result.itl_values.append(t_now - t_last)
                             t_last = t_now
-                            result.raw_text += token   
+                            result.raw_text += token
 
+        try:
+            await asyncio.wait_for(_do(), timeout=self.config.probe_timeout_s)
         except asyncio.TimeoutError:
-            result.success, result.error = False, "timeout"
+            result.success = False
+            result.error   = f"timeout>{self.config.probe_timeout_s:.0f}s (HOL blocking)"
         except aiohttp.ClientError as exc:
             result.success, result.error = False, str(exc)
 
@@ -553,7 +676,8 @@ class ITLProbes:
         payload = self._build_payload(prompt, max_tokens, stream=False)
         session = await self._get_session()
         t_start = time.perf_counter()
-        try:
+
+        async def _do() -> None:
             async with session.post(
                 self.config.target.endpoint,
                 json=payload,
@@ -564,121 +688,34 @@ class ITLProbes:
                     result.error   = f"HTTP {resp.status}"
                 else:
                     await resp.json()
-                    result.total_s = time.perf_counter() - t_start
-                    result.ttft_s  = result.total_s  # close approximation for tiny outputs
+                    result.ttft_s = time.perf_counter() - t_start
+
+        try:
+            await asyncio.wait_for(_do(), timeout=self.config.probe_timeout_s)
         except asyncio.TimeoutError:
-            result.success, result.error = False, "timeout"
+            result.success = False
+            result.error   = f"timeout>{self.config.probe_timeout_s:.0f}s (HOL blocking)"
         except Exception as exc:
             result.success, result.error = False, str(exc)
+
         result.total_s = time.perf_counter() - t_start
         return result
 
     # ═════════════════════════════════════════════════════════════════════════
-    # 1. single_probe — primary side-channel measurement unit
-    # ═════════════════════════════════════════════════════════════════════════
-
-    async def single_probe(
-        self,
-        prompt:     Optional[str] = None,
-        max_tokens: Optional[int] = None,
-    ) -> ProbeResult:
-        """
-        One-shot streaming probe. Measures ITL and TTFT.
-
-        This is the core measurement primitive used by the Fill & Squeeze
-        control loop to estimate KV cache pressure via ITL side-channel.
-        """
-        p = prompt     or self._PROMPTS["fixed_50"]
-        t = max_tokens or self.config.token_budget
-        result = await self._stream_probe(p, t, probe_type="single")
-        if result.success:
-            result.kv_usage_est = self.estimator.estimate(
-                [v * 1000.0 for v in result.itl_values]
-            )
-            self._itl_history.append(result)
-        return result
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # 2. burst_probe — concurrency / queue depth indicator
-    # ═════════════════════════════════════════════════════════════════════════
-
-    async def burst_probe(
-        self,
-        n:          Optional[int] = None,
-        prompt:     Optional[str] = None,
-        max_tokens: Optional[int] = None,
-    ) -> BurstProbeResult:
-        """
-        Fire N concurrent probe requests simultaneously.
-
-        Diagnostics:
-          • High TTFT variance across concurrent probes → HOL blocking
-            (some requests slip through, others stall at free_block_queue check)
-          • Mean TTFT >> single_probe TTFT → WAITING queue growing
-          • High ITL CoV across requests → preemption evicting some runners
-        """
-        concurrency = n      or self.config.burst_concurrency
-        p           = prompt or self._PROMPTS["fixed_50"]
-        t           = max_tokens or self.config.token_budget
-
-        tasks      = [self._stream_probe(p, t, probe_type="burst") for _ in range(concurrency)]
-        individual = list(await asyncio.gather(*tasks))
-
-        burst = BurstProbeResult(n_probes=concurrency, individual=individual)
-        burst.compute()
-
-        if burst.n_success > 0:
-            all_itl_ms = [
-                v * 1000.0
-                for r in individual if r.success
-                for v in r.itl_values
-            ]
-            burst.kv_usage_est = self.estimator.estimate(all_itl_ms)
-
-        return burst
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # 3. ttft_probe — WAITING queue depth indicator
-    # ═════════════════════════════════════════════════════════════════════════
-
-    async def ttft_probe(
-        self,
-        prompt:         Optional[str] = None,
-        use_streaming:  bool          = True,
-    ) -> ProbeResult:
-        """
-        Minimise output tokens so TTFT dominates the measurement.
-
-        TTFT = prefill_time + queue_wait_time.
-        A rising TTFT baseline indicates either:
-          (a) growing WAITING queue (approaching HOL blocking), or
-          (b) the system is preempting and recomputing prefills (vLLM v1).
-        """
-        p = prompt or self._PROMPTS["minimal"]
-        if use_streaming:
-            return await self._stream_probe(p, max_tokens=5, probe_type="ttft")
-        return await self._nonstream_probe(p, max_tokens=5, probe_type="ttft")
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # 4. calibrate_baseline — idle reference
+    # 1. calibrate_baseline
     # ═════════════════════════════════════════════════════════════════════════
 
     async def calibrate_baseline(
         self,
-        n_samples:      Optional[int] = None,
-        warm_up:        int           = 1,
-        inter_delay_s:  float         = 0.5,
+        n_samples:     Optional[int] = None,
+        warm_up:       int           = 1,
+        inter_delay_s: float         = 0.5,
     ) -> dict:
         """
-        Establish baseline ITL and TTFT under (approximately) idle conditions.
+        Establish baseline ITL and TTFT under idle conditions.
 
-        Should be called before any attack phase. Runs `warm_up` discarded
-        probes to avoid cold-start KV cache / prefix cache effects, then
-        collects `n_samples` measurements.
-
-        Populates:
-          config.baseline_itl_ms / config.baseline_ttft_s
-          estimator._baseline_itl_ms
+        Call before any attack phase. Runs `warm_up` discarded probes to avoid
+        cold-start effects, then collects `n_samples` measurements.
         """
         n = n_samples or self.config.baseline_window
 
@@ -714,10 +751,95 @@ class ITLProbes:
             "ttft_stddev_s":    round(statistics.stdev(ttft_vals) if len(ttft_vals) > 1 else 0, 4),
         }
         logger.info("Baseline calibrated: %s", result)
+        if self.config.baseline_cache_path:
+            self._save_baseline(self.config.baseline_cache_path)
+        if self.config.history_path:
+            # Old history was measured against a different baseline — discard it.
+            p = Path(self.config.history_path)
+            if p.exists():
+                p.write_text("")
+                logger.info("Probe history cleared (new baseline) → %s", self.config.history_path)
+            self._itl_history.clear()
+            self._state_history.clear()
         return result
 
     # ═════════════════════════════════════════════════════════════════════════
-    # 5. preemption_probe — intra-request ITL spike detection
+    # 2. single_probe
+    # ═════════════════════════════════════════════════════════════════════════
+
+    async def single_probe(
+        self,
+        prompt:     Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> ProbeResult:
+        """One-shot streaming probe. Measures ITL and TTFT."""
+        p = prompt     or self._PROMPTS["fixed_50"]
+        t = max_tokens or self.config.max_probe_tokens
+        result = await self._stream_probe(p, t, probe_type="single")
+        if result.success:
+            result.kv_usage_est = self.estimator.estimate(
+                [v * 1000.0 for v in result.itl_values]
+            )
+            self._itl_history.append(result)
+            self._append_history(result)
+        return result
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 3. burst_probe
+    # ═════════════════════════════════════════════════════════════════════════
+
+    async def burst_probe(
+        self,
+        n:          Optional[int] = None,
+        prompt:     Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> BurstProbeResult:
+        """
+        Fire N concurrent probe requests simultaneously.
+
+        High TTFT variance across concurrent probes indicates HOL blocking.
+        Mean TTFT >> single_probe TTFT indicates a growing wait queue.
+        """
+        concurrency = n      or self.config.burst_concurrency
+        p           = prompt or self._PROMPTS["fixed_50"]
+        t           = max_tokens or self.config.max_probe_tokens
+
+        tasks      = [self._stream_probe(p, t, probe_type="burst") for _ in range(concurrency)]
+        individual = list(await asyncio.gather(*tasks))
+
+        burst = BurstProbeResult(n_probes=concurrency, individual=individual)
+        burst.compute()
+
+        if burst.n_success > 0:
+            all_itl_ms = [
+                v * 1000.0
+                for r in individual if r.success
+                for v in r.itl_values
+            ]
+            burst.kv_usage_est = self.estimator.estimate(all_itl_ms)
+
+        return burst
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 4. ttft_probe
+    # ═════════════════════════════════════════════════════════════════════════
+
+    async def ttft_probe(
+        self,
+        prompt:        Optional[str] = None,
+        use_streaming: bool          = True,
+    ) -> ProbeResult:
+        """
+        Minimise output tokens so TTFT dominates the measurement.
+        Rising TTFT indicates a growing wait queue or prefill recompute.
+        """
+        p = prompt or self._PROMPTS["minimal"]
+        if use_streaming:
+            return await self._stream_probe(p, max_tokens=5, probe_type="ttft")
+        return await self._nonstream_probe(p, max_tokens=5, probe_type="ttft")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 5. preemption_probe
     # ═════════════════════════════════════════════════════════════════════════
 
     async def preemption_probe(
@@ -730,15 +852,11 @@ class ITLProbes:
         """
         Long-running streaming probe that watches for intra-request ITL spikes.
 
-        Preemption signature (vLLM scheduler):
-          When the scheduler invokes _preempt() on a running request, the
-          victim experiences a multi-second silence between tokens before
-          resuming (swap I/O in v0, full recompute in v1). This manifests
-          as a sudden ITL spike >> local mean.
+        When vLLM preempts a running request, the victim sees a multi-second
+        silence between tokens before resuming. This manifests as a sudden
+        ITL spike >> local mean.
 
         Spike criterion: itl_i > spike_threshold × mean(preceding 10 ITLs)
-
-        Returns spike timestamps, count, severity, and preemption_detected flag.
         """
         p               = prompt or self._PROMPTS["fixed_100"]
         result          = ProbeResult(probe_type="preemption")
@@ -747,23 +865,21 @@ class ITLProbes:
 
         payload = self._build_payload(p, max_tokens, stream=True)
         session = await self._get_session()
-        t_start   = time.perf_counter()
-        t_deadline = t_start + duration_s
-        t_last    = t_start
-        t_first: Optional[float] = None
+        t_start    = time.perf_counter()
+        t_last     = t_start
 
-        try:
+        async def _stream() -> None:
             async with session.post(
                 self.config.target.endpoint,
                 json=payload,
                 headers=self.config.target.auth_headers,
             ) as resp:
                 if resp.status >= 400:
-                    return {"success": False, "error": f"HTTP {resp.status}"}
+                    result.success = False
+                    result.error   = f"HTTP {resp.status}"
+                    return
 
                 async for raw in resp.content:
-                    if time.perf_counter() > t_deadline:
-                        break
                     line = raw.decode("utf-8").strip()
                     if not line or not line.startswith("data:"):
                         continue
@@ -774,23 +890,25 @@ class ITLProbes:
                     token = self._extract_token(data_str)
                     if token is not None:
                         itl = t_now - t_last
-                        if t_first is None:
-                            t_first, result.ttft_s = t_now, t_now - t_start
+                        if not result.itl_values:
+                            result.ttft_s = t_now - t_start
                         result.itl_values.append(itl)
                         local_mean = statistics.mean(window) if window else itl
                         if window and itl > spike_threshold * local_mean:
                             spike_events.append({
-                                "token_index": len(result.itl_values) - 1,
-                                "itl_s":       round(itl, 4),
+                                "token_index":  len(result.itl_values) - 1,
+                                "itl_s":        round(itl, 4),
                                 "local_mean_s": round(local_mean, 4),
-                                "ratio":       round(itl / (local_mean + 1e-9), 2),
-                                "elapsed_s":   round(t_now - t_start, 3),
+                                "ratio":        round(itl / (local_mean + 1e-9), 2),
+                                "elapsed_s":    round(t_now - t_start, 3),
                             })
                         window.append(itl)
-                        t_last = t_now
 
+        try:
+            # wait_for enforces duration_s even when no tokens arrive (WAITING queue)
+            await asyncio.wait_for(_stream(), timeout=duration_s)
         except asyncio.TimeoutError:
-            result.success, result.error = False, "timeout"
+            pass   # clean deadline expiry — not a failure, just the window closing
         except Exception as exc:
             result.success, result.error = False, str(exc)
 
@@ -798,74 +916,19 @@ class ITLProbes:
         result.compute_derived()
 
         return {
-            "success":              result.success,
-            "ttft_s":               round(result.ttft_s, 4),
-            "total_s":              round(result.total_s, 4),
-            "tokens_received":      result.tokens_out,
-            "mean_itl_ms":          round(result.mean_itl_ms, 4),
-            "itl_stddev_ms":        round(result.itl_stddev_ms, 4),
-            "spike_count":          len(spike_events),
-            "spikes":               spike_events,
-            "preemption_detected":  len(spike_events) > 0,
+            "success":             result.success,
+            "ttft_s":              round(result.ttft_s, 4),
+            "total_s":             round(result.total_s, 4),
+            "tokens_received":     result.tokens_out,
+            "mean_itl_ms":         round(result.mean_itl_ms, 4),
+            "itl_stddev_ms":       round(result.itl_stddev_ms, 4),
+            "spike_count":         len(spike_events),
+            "spikes":              spike_events,
+            "preemption_detected": len(spike_events) > 0,
         }
 
     # ═════════════════════════════════════════════════════════════════════════
-    # 6. hol_probe — Head-of-Line blocking detection
-    # ═════════════════════════════════════════════════════════════════════════
-
-    async def hol_probe(
-        self,
-        n_fill:      int           = 4,
-        long_prompt: Optional[str] = None,
-        short_prompt: Optional[str] = None,
-    ) -> dict:
-        """
-        Detect HOL blocking by comparing short-request TTFT under memory pressure.
-
-        Method (from Fill & Squeeze §5.1):
-          1. Send `n_fill` long-output requests concurrently (fill KV pressure)
-          2. Immediately send one minimal short probe (50 ms stagger)
-          3. HOL detected if short_ttft >> baseline_ttft
-
-        When free_block_queue is exhausted and can_allocate() returns False,
-        the FCFS WAITING queue freezes: the short probe's TTFT explodes even
-        though computational slots are still available.
-
-        HOL indicator: ttft_ratio = short_ttft / baseline_ttft > hol_threshold
-        """
-        long_p  = long_prompt  or self._PROMPTS["fixed_100"]
-        short_p = short_prompt or self._PROMPTS["minimal"]
-
-        fill_tasks = [
-            asyncio.create_task(
-                self._stream_probe(long_p, 150, probe_type="hol_fill")
-            )
-            for _ in range(n_fill)
-        ]
-        # Stagger works now: fill tasks are already running on the event loop
-        await asyncio.sleep(0.05)
-        short_result, *fill_results = await asyncio.gather(
-            self._stream_probe(short_p, 5, probe_type="hol_short"),
-            *fill_tasks,
-        )
-
-        baseline   = max(self.config.baseline_ttft_s, 1e-6)
-        short_ttft = short_result.ttft_s if short_result.success else -1.0
-        ratio      = short_ttft / baseline if short_ttft > 0 else -1.0
-
-        fill_ttfts = [r.ttft_s for r in fill_results if r.success]
-        return {
-            "hol_detected":      ratio > self.config.ttft_hol_threshold,
-            "ttft_ratio":        round(ratio, 3),
-            "short_ttft_s":      round(short_ttft, 4),
-            "baseline_ttft_s":   round(baseline, 4),
-            "threshold":         self.config.ttft_hol_threshold,
-            "fill_n":            len(fill_results),
-            "fill_mean_ttft_s":  round(statistics.mean(fill_ttfts), 4) if fill_ttfts else -1.0,
-        }
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # 7. memory_pressure_scan — ITL time-series (Fill ramp mapping)
+    # 6. memory_pressure_scan
     # ═════════════════════════════════════════════════════════════════════════
 
     async def memory_pressure_scan(
@@ -878,14 +941,16 @@ class ITLProbes:
         """
         Run `n_probes` sequential single probes spaced `interval_s` apart.
 
-        Use cases:
-          • Map ITL rise during Fill phase to identify saturation point
-          • Detect recovery (ITL decay post-attack)
-          • Collect (ITL, kv_usage) pairs for offline regressor training
-          • Validate that an attack is maintaining memory pressure
+        Each probe respects ProbeConfig.probe_timeout_s — if HOL blocking is
+        active and a probe receives no tokens it is marked as timed-out
+        (success=False, kv_usage_est=-1.0) and the scan continues.
+
+        Useful for mapping ITL rise during an attack, detecting recovery after
+        an attack ends, or collecting (ITL, kv_usage) pairs for offline
+        regressor training.
         """
         p = prompt     or self._PROMPTS["fixed_50"]
-        t = max_tokens or self.config.token_budget
+        t = max_tokens or self.config.max_probe_tokens
         results: List[ProbeResult] = []
 
         for i in range(n_probes):
@@ -901,39 +966,31 @@ class ITLProbes:
         return results
 
     # ═════════════════════════════════════════════════════════════════════════
-    # 8. estimate_kv_usage — live Û_sys for adaptive control
+    # 7. estimate_kv_usage
     # ═════════════════════════════════════════════════════════════════════════
 
     async def estimate_kv_usage(self) -> float:
-        """
-        Single-probe KV cache utilisation estimate: Û_sys ∈ [0.0, 1.0].
-
-        Primary feedback signal for the Fill & Squeeze control loop:
-            Δ_mem = C_sat - estimate_kv_usage()
-            Δ_mem large → dispatch P_High  (Fill phase: rapid VRAM occupation)
-            Δ_mem → 0   → dispatch P_Low   (Squeeze phase: trigger preemption)
-            Δ_mem < 0   → back-off         (avoid self-preemption)
-        """
+        """Single-probe KV cache utilisation estimate: Û_sys ∈ [0.0, 1.0]."""
         r = await self.single_probe()
         return r.kv_usage_est
 
     # ═════════════════════════════════════════════════════════════════════════
-    # 9. classify_state — InfraState classifier
+    # 8. classify_state
     # ═════════════════════════════════════════════════════════════════════════
 
     def classify_state(
         self,
-        probe: Optional[ProbeResult]      = None,
-        burst: Optional[BurstProbeResult] = None,
+        probe: Optional[ProbeResult] = None,
     ) -> InfraState:
         """
         Classify current infra state from probe data + rolling ITL history.
 
-        Decision tree (priority order):
+        Priority order:
+          HOL_BLOCKED — probe failed/timed out (request never left WAITING queue)
           THRASHING   — rolling CoV(ITL) > threshold (preemption loop)
-          HOL_BLOCKED — TTFT >> baseline (WAITING queue frozen)
-          SATURATED   — mean ITL > 3× baseline (KV near 100%)
-          FILLING     — mean ITL > 1.5× baseline (KV rising)
+          HOL_BLOCKED — TTFT >> baseline (wait queue frozen)
+          SATURATED   — smoothed ITL > 3× baseline
+          FILLING     — smoothed ITL > 1.5× baseline
           IDLE        — near baseline
           UNKNOWN     — no baseline calibrated
         """
@@ -946,7 +1003,13 @@ class ITLProbes:
         if ref is None:
             return InfraState.UNKNOWN
 
-        baseline_itl  = self.config.baseline_itl_ms
+        # Failed probe means request never reached RUNNING state → HOL blocking
+        if not ref.success or ref.tokens_out == 0:
+            state = InfraState.HOL_BLOCKED
+            self._state_history.append(state)
+            return state
+
+        baseline_itl  = max(self.config.baseline_itl_ms, 1e-6)
         baseline_ttft = max(self.config.baseline_ttft_s, 1e-6)
 
         # Thrashing: rolling CoV over history window
@@ -959,8 +1022,12 @@ class ITLProbes:
                     self._state_history.append(state)
                     return state
 
-        itl_ratio  = ref.mean_itl_ms  / (baseline_itl  + 1e-9)
-        ttft_ratio = ref.ttft_s        / baseline_ttft
+        # Smooth ITL over last 3 successful probes to reduce single-probe noise
+        recent = [r.mean_itl_ms for r in list(self._itl_history)[-3:] if r.success and r.mean_itl_ms > 0]
+        smoothed_itl = statistics.mean(recent) if recent else ref.mean_itl_ms
+
+        itl_ratio  = smoothed_itl  / baseline_itl
+        ttft_ratio = ref.ttft_s    / baseline_ttft
 
         if   ttft_ratio > self.config.ttft_hol_threshold:
             state = InfraState.HOL_BLOCKED
@@ -975,7 +1042,208 @@ class ITLProbes:
         return state
 
     # ═════════════════════════════════════════════════════════════════════════
-    # 10. monitor — continuous async polling loop
+    # 9. tpot_probe
+    # ═════════════════════════════════════════════════════════════════════════
+
+    async def tpot_probe(
+        self,
+        n_probes:   int           = 5,
+        prompt:     Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> dict:
+        """
+        Measure TPOT (Time Per Output Token = mean ITL) across n_probes requests.
+
+        TPOT is a direct proxy for GPU memory bandwidth contention — it rises
+        proportionally to KV cache occupancy as attention becomes memory-bound.
+        """
+        p = prompt     or self._PROMPTS["fixed_50"]
+        t = max_tokens or self.config.max_probe_tokens
+
+        results = []
+        for _ in range(n_probes):
+            results.append(await self._stream_probe(p, t, probe_type="tpot"))
+
+        good = [r for r in results if r.success and r.tpot_ms > 0]
+        if not good:
+            return {"success": False, "error": "no successful probes", "n": 0}
+
+        tpots        = sorted([r.tpot_ms for r in good])
+        n            = len(tpots)
+        baseline_itl = max(self.config.baseline_itl_ms, 1e-6)
+        mean_tpot    = statistics.mean(tpots)
+        p95_idx      = min(int(math.ceil(0.95 * n)) - 1, n - 1)
+
+        return {
+            "success":         True,
+            "n":               n,
+            "mean_tpot_ms":    round(mean_tpot, 3),
+            "p95_tpot_ms":     round(tpots[p95_idx], 3),
+            "tpot_stddev_ms":  round(statistics.stdev(tpots) if n > 1 else 0.0, 3),
+            "tpot_ratio":      round(mean_tpot / baseline_itl, 3),
+            "baseline_itl_ms": round(baseline_itl, 3),
+            "degraded":        (mean_tpot / baseline_itl) > self.config.itl_fill_threshold,
+        }
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 10. request_timeout_probe
+    # ═════════════════════════════════════════════════════════════════════════
+
+    async def request_timeout_probe(
+        self,
+        n_probes:     int           = 10,
+        hard_timeout: float         = 30.0,
+        prompt:       Optional[str] = None,
+        max_tokens:   int           = 100,
+    ) -> dict:
+        """Measure failure/timeout rate under load — direct degradation signal."""
+        p = prompt or self._PROMPTS["fixed_50"]
+
+        async def _one() -> tuple:
+            try:
+                r = await asyncio.wait_for(
+                    self._stream_probe(p, max_tokens, probe_type="abort_probe"),
+                    timeout=hard_timeout,
+                )
+                suspiciously_fast = r.success and r.total_s < 0.3
+                return r.success, r.tokens_out, ("partial" if suspiciously_fast else None)
+            except asyncio.TimeoutError:
+                return False, 0, "client_timeout"
+            except Exception as exc:
+                return False, 0, str(exc)
+
+        raw    = list(await asyncio.gather(*[_one() for _ in range(n_probes)]))
+        n_ok   = sum(1 for r in raw if r[0])
+        n_part = sum(1 for r in raw if r[2] == "partial")
+        n_fail = n_probes - n_ok
+        errors = [r[2] for r in raw if r[2] and r[2] != "partial"]
+
+        return {
+            "n_probes":             n_probes,
+            "n_success":            n_ok,
+            "n_partial":            n_part,
+            "n_failed":             n_fail,
+            "abort_rate":           round(n_fail  / max(n_probes, 1), 4),
+            "partial_rate":         round(n_part  / max(n_probes, 1), 4),
+            "error_types":          list(set(errors)),
+            "scheduler_overloaded": (n_fail / max(n_probes, 1)) > 0.3,
+        }
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 11. load_balancer_probe
+    # ═════════════════════════════════════════════════════════════════════════
+
+    async def load_balancer_probe(
+        self,
+        n_pairs:             int   = 6,
+        inter_pair_delay_s:  float = 1.0,
+        cache_hit_threshold: float = 0.70,
+        prompt_repeats:      int   = 25,
+        n_warmup:            int   = 3,
+    ) -> dict:
+        """
+        Detect load balancer presence via prefix-cache consistency.
+
+        Sends N pairs of identical requests in rapid succession. On a single
+        server with Automatic Prefix Caching (APC) enabled, the second request
+        in each pair skips prefill and shows dramatically lower TTFT (cache hit).
+        A load balancer that routes the second request to a different backend
+        produces no cache hit — TTFT stays similar to the first.
+
+        Prompt sizing: _LB_CONTEXT is repeated `prompt_repeats` times (default
+        25 → ~10,000 tokens) so that prefill takes 80-330 ms depending on GPU,
+        making cache hits visible above the network RTT baseline.
+
+        Warm-up: `n_warmup` discarded requests stabilise the server before
+        measurement (eliminates CUDA kernel compilation and first-request memory
+        allocation overhead that would otherwise inflate pair-0 cold TTFT).
+
+        Only max_tokens=5 are generated — only TTFT matters here.
+
+        Requires temperature=0 (default) and APC enabled on the server.
+
+        Estimated backend count: N_backends ≈ 1 / cache_hit_rate
+        """
+        context_body = "\n\n".join([self._LB_CONTEXT] * prompt_repeats)
+
+        # ── Warm-up phase ──────────────────────────────────────────────────────
+        # Use different UUIDs so warm-up requests don't pre-warm the test cache.
+        logger.info("load_balancer_probe: running %d warm-up requests...", n_warmup)
+        for _ in range(n_warmup):
+            warmup_prompt = (
+                f"[warmup:{uuid.uuid4().hex}]\n\n{context_body}\n\n"
+                "Question: In one word, what is this text about?"
+            )
+            await self._stream_probe(warmup_prompt, max_tokens=5, probe_type="lb_warmup")
+
+        pairs = []
+
+        for i in range(n_pairs):
+            # UUID prefix makes the full prompt unique per pair. vLLM's block
+            # chain-hashing propagates the UUID through all subsequent blocks,
+            # so the long shared context body cannot leak across pairs.
+            prompt = (
+                f"[probe-id:{uuid.uuid4().hex}]\n\n{context_body}\n\n"
+                "Question: In one word, what type of system is described above?"
+            )
+
+            # max_tokens=5: only need first token for TTFT measurement
+            r_cold = await self._stream_probe(prompt, max_tokens=5, probe_type="lb_cold")
+            r_warm = await self._stream_probe(prompt, max_tokens=5, probe_type="lb_warm")
+
+            if r_cold.success and r_warm.success and r_cold.ttft_s > 0:
+                ratio = r_warm.ttft_s / r_cold.ttft_s
+                pairs.append({
+                    "pair":       i,
+                    "ttft_cold_s": round(r_cold.ttft_s, 4),
+                    "ttft_warm_s": round(r_warm.ttft_s, 4),
+                    "ratio":      round(ratio, 3),
+                    "cache_hit":  ratio < cache_hit_threshold,
+                })
+
+            if i < n_pairs - 1:
+                await asyncio.sleep(inter_pair_delay_s)
+
+        if not pairs:
+            return {"success": False, "error": "no successful probe pairs"}
+
+        n_hits   = sum(1 for p in pairs if p["cache_hit"])
+        hit_rate = n_hits / len(pairs)
+        ratios   = [p["ratio"] for p in pairs]
+        median_ratio = sorted(ratios)[len(ratios) // 2]
+
+        # Estimate backend count
+        if hit_rate > 0:
+            est_backends: Any = max(1, round(1.0 / hit_rate))
+        else:
+            est_backends = f">{len(pairs)}"
+
+        # Verdict
+        if hit_rate >= 0.8:
+            verdict = "single_server"
+        elif hit_rate >= 0.4:
+            verdict = "load_balanced_2_backends"
+        elif hit_rate > 0.0:
+            verdict = "load_balanced"
+        else:
+            # Zero cache hits: either many backends, or APC is disabled.
+            # With the long prompt, APC-disabled would still show near-1.0
+            # ratios; many backends would show ratios scattered around 1.0.
+            verdict = "load_balanced_or_apc_disabled"
+
+        return {
+            "success":            True,
+            "n_pairs":            len(pairs),
+            "n_cache_hits":       n_hits,
+            "cache_hit_rate":     round(hit_rate, 3),
+            "median_ttft_ratio":  round(median_ratio, 3),
+            "estimated_backends": est_backends,
+            "verdict":            verdict,
+            "pairs":              pairs,
+        }
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 12. monitor
     # ═════════════════════════════════════════════════════════════════════════
 
     async def monitor(
@@ -990,29 +1258,15 @@ class ITLProbes:
         Continuous async polling loop for real-time infra state tracking.
 
         Fires single_probe() every `interval_s` seconds, classifies InfraState,
-        and invokes optional async-or-sync callbacks:
-        on_probe(result, state)      — every probe cycle
-        on_state_change(old, new)    — only on InfraState transitions
+        and invokes optional callbacks:
+          on_probe(result, state)      — every probe cycle
+          on_state_change(old, new)    — only on InfraState transitions
 
-        Designed to run as a background asyncio.Task alongside attack workers:
-
+        Designed to run as a background task alongside attack workers:
             stop = asyncio.Event()
-            task = asyncio.create_task(probes.monitor(
-                interval_s=2.0,
-                on_state_change=lambda old, new: dispatch_fill_squeeze(new),
-                stop_event=stop,
-            ))
+            task = asyncio.create_task(probes.monitor(stop_event=stop, ...))
             # ... run attack ...
-            stop.set()
-            await task
-
-        Parameters
-        ──────────
-        interval_s      — seconds between probe cycles
-        on_probe        — callback(ProbeResult, InfraState) every cycle
-        on_state_change — callback(old_state, new_state) on transitions only
-        stop_event      — asyncio.Event; set() to terminate the loop cleanly
-        max_iterations  — hard cap on probe count (None = run forever)
+            stop.set(); await task
         """
         prev_state = InfraState.UNKNOWN
         iteration  = 0
@@ -1023,11 +1277,9 @@ class ITLProbes:
                 break
 
             t_cycle_start = time.perf_counter()
-
             result = await self.single_probe()
             state  = self.classify_state(probe=result)
 
-            # ── on_probe: fires every cycle ───────────────────────────────────
             if on_probe is not None:
                 try:
                     ret = on_probe(result, state)
@@ -1036,7 +1288,6 @@ class ITLProbes:
                 except Exception as exc:
                     logger.warning("monitor on_probe callback raised: %s", exc)
 
-            # ── on_state_change: fires only on InfraState transitions ─────────
             if state != prev_state and on_state_change is not None:
                 try:
                     ret = on_state_change(prev_state, state)
@@ -1048,148 +1299,17 @@ class ITLProbes:
             prev_state = state
             iteration += 1
 
-            # ── Interval sleep — wakes early if stop_event is set ────────────
             elapsed = time.perf_counter() - t_cycle_start
             sleep_s = max(0.0, interval_s - elapsed)
             try:
                 await asyncio.wait_for(_stop.wait(), timeout=sleep_s)
-                break   # stop_event fired during sleep → clean exit
+                break
             except asyncio.TimeoutError:
-                pass    # normal path: interval elapsed, continue loop
+                pass
 
-
-    async def tpot_probe(
-        self,
-        n_probes:   int           = 5,
-        prompt:     Optional[str] = None,
-        max_tokens: Optional[int] = None,
-    ) -> dict:
-        """
-        Measure TPOT (Time Per Output Token = mean ITL) across n_probes requests.
-
-        TPOT isolates decode-phase throughput from queuing effects and is a
-        direct proxy for GPU memory bandwidth contention.  Under Fill & Squeeze
-        saturation it rises proportionally to KV cache occupancy because the
-        attention matmuls become increasingly memory-bound.
-        """
-        p = prompt     or self._PROMPTS["fixed_50"]
-        t = max_tokens or self.config.token_budget
-
-        results = []
-        for _ in range(n_probes):
-            results.append(await self._stream_probe(p, t, probe_type="tpot"))
-
-        good = [r for r in results if r.success and r.tpot_ms > 0]
-        if not good:
-            return {"success": False, "error": "no successful probes", "n": 0}
-
-        tpots        = sorted([r.tpot_ms for r in good])
-        n            = len(tpots)
-        baseline_itl = max(self.config.baseline_itl_ms, 1e-6)
-        mean_tpot    = statistics.mean(tpots)
-        tpot_ratio   = mean_tpot / baseline_itl
-
-
-        p95_idx = min(int(math.ceil(0.95 * n)) - 1, n - 1)
-
-        return {
-            "success":         True,
-            "n":               n,
-            "mean_tpot_ms":    round(mean_tpot, 3),
-            "p95_tpot_ms":     round(tpots[p95_idx], 3),
-            "tpot_stddev_ms":  round(statistics.stdev(tpots) if n > 1 else 0.0, 3),
-            "tpot_ratio":      round(tpot_ratio, 3),
-            "baseline_itl_ms": round(baseline_itl, 3),
-            "degraded":        tpot_ratio > self.config.itl_fill_threshold,
-        }
-
-
-    async def request_timeout_probe(
-        self,
-        n_probes:     int           = 10,
-        hard_timeout: float         = 30.0,
-        prompt:       Optional[str] = None,
-        max_tokens:   int           = 100,
-    ) -> dict:
-        p = prompt or self._PROMPTS["fixed_50"]
-
-        async def _one() -> tuple:
-            try:
-                r = await asyncio.wait_for(
-                    self._stream_probe(p, max_tokens, probe_type="abort_probe"),
-                    timeout=hard_timeout,
-                )
-                # ── partial = completed suspiciously fast with zero content
-                # Do NOT use chunk count — hosted APIs batch chunks arbitrarily
-                suspiciously_fast = r.success and r.total_s < 0.3
-                return r.success, r.tokens_out, ("partial" if suspiciously_fast else None)
-            except asyncio.TimeoutError:
-                return False, 0, "client_timeout"
-            except Exception as exc:
-                return False, 0, str(exc)
-
-        raw    = list(await asyncio.gather(*[_one() for _ in range(n_probes)]))
-        n_ok   = sum(1 for ok, _, __ in raw if ok)
-        n_part = sum(1 for _, __, e  in raw if e == "partial")
-        n_fail = n_probes - n_ok
-        errors = [e for _, __, e in raw if e and e != "partial"]
-
-        return {
-            "n_probes":             n_probes,
-            "n_success":            n_ok,
-            "n_partial":            n_part,
-            "n_failed":             n_fail,
-            "abort_rate":           round(n_fail  / max(n_probes, 1), 4),
-            "partial_rate":         round(n_part  / max(n_probes, 1), 4),
-            "error_types":          list(set(errors)),
-            "scheduler_overloaded": (n_fail / max(n_probes, 1)) > 0.3,
-        }
-
-    async def adaptive_fill_signal(
-        self,
-        c_sat: float = 0.90,
-    ) -> dict:
-        """
-        Combined measurement + decision primitive for the Fill & Squeeze loop.
-
-            action = "fill"    → Δ_mem large; dispatch high-load requests
-            action = "squeeze" → Δ_mem ≈ 0;   dispatch long-output requests
-            action = "backoff" → Δ_mem < 0;   reduce request rate
-            action = "wait"    → baseline not calibrated or probe failed
-        """
-        result = await self.single_probe()
-        if not result.success or not self._baseline_calibrated:
-            return {
-                "action":       "wait",
-                "kv_usage_est": -1.0,
-                "delta_mem":    -1.0,
-                "state":        InfraState.UNKNOWN.value,
-                "probe":        result.to_dict(),
-            }
-
-        kv_est = result.kv_usage_est
-        delta  = c_sat - kv_est
-        state  = self.classify_state(probe=result)
-
-        if   state in (InfraState.THRASHING, InfraState.DEGRADED):
-            action = "backoff"
-        elif delta < 0:
-            action = "backoff"
-        elif delta < 0.05:
-            action = "squeeze"
-        elif state == InfraState.HOL_BLOCKED:
-            action = "squeeze"
-        else:
-            action = "fill"
-
-        return {
-            "action":       action,
-            "kv_usage_est": round(kv_est, 4),
-            "delta_mem":    round(delta, 4),
-            "c_sat":        c_sat,
-            "state":        state.value,
-            "probe":        result.to_dict(),
-        }
+    # ═════════════════════════════════════════════════════════════════════════
+    # 12. rolling_summary
+    # ═════════════════════════════════════════════════════════════════════════
 
     def rolling_summary(self) -> dict:
         """Aggregate stats over the last `rolling_window` successful probes."""
@@ -1202,13 +1322,11 @@ class ITLProbes:
         kvs   = [r.kv_usage_est for r in good if r.kv_usage_est >= 0]
         n     = len(good)
 
-        slope = float(np.polyfit(np.arange(n), itls, 1)[0]) if n >= 2 else 0.0
-
+        slope        = float(np.polyfit(np.arange(n), itls, 1)[0]) if n >= 2 else 0.0
         baseline_itl = max(self.config.baseline_itl_ms, 1e-6)
         degradation  = statistics.mean(itls) / baseline_itl
-
-        s = sorted(itls)
-        p95_idx = min(int(math.ceil(0.95 * n)) - 1, n - 1)
+        s            = sorted(itls)
+        p95_idx      = min(int(math.ceil(0.95 * n)) - 1, n - 1)
 
         return {
             "n":                      n,

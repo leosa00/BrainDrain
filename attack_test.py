@@ -17,16 +17,16 @@ google_paid = TargetConfig(
 )
 
 runpod_vllm = TargetConfig(
-    base_url="https://wxjz5hyynv2a6n-8000.proxy.runpod.net",
+    base_url="https://4bd8ygkrqvok94-8000.proxy.runpod.net",
     model="deepseek-r1-7b",           # must match --served-model-name
     api_format=APIFormat.CUSTOM,       # vLLM is OpenAI-compatible
     api_key=secret.runpod_api_key,
-    timeout=600.0,
+    timeout=1000.0,
 )
 target = runpod_vllm
 
 
-N_INSTANCES = 9
+N_INSTANCES = 15
 
 PUZZLE_FILE = "prompts/reasoningBomb_puzzles.json"
 BUDGET_TIER = "256"

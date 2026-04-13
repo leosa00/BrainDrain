@@ -19,7 +19,7 @@ local = TargetConfig(
     )
 
 runpod_vllm = TargetConfig(
-    base_url="https://wxjz5hyynv2a6n-8000.proxy.runpod.net",
+    base_url="https://xx3t94ynacne3q--8000.proxy.runpod.net",
     model="deepseek-r1-7b",           # must match --served-model-name
     api_format=APIFormat.CUSTOM,       # vLLM is OpenAI-compatible
     api_key=secret.runpod_api_key,

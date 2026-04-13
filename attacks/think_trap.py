@@ -368,19 +368,22 @@ def make_victim_fn(
         return " ".join(str(t) for t in ids)
 
     async def _victim(token_ids: list[int]) -> int:
+        import json as _json
         prompt_text = _ids_to_text(token_ids)
         payload: dict[str, Any] = {
-            "model":       target.model,
-            "messages":    [{"role": "user", "content": prompt_text}],
-            "max_tokens":  max_tokens,
-            "temperature": 1.0,  # non-zero temperature for diverse outputs
-            "stream":      False,
+            "model":          target.model,
+            "messages":       [{"role": "user", "content": prompt_text}],
+            "max_tokens":     max_tokens,
+            "temperature":    1.0,  # non-zero temperature for diverse outputs
+            "stream":         True,
+            "stream_options": {"include_usage": True},
         }
         timeout   = aiohttp.ClientTimeout(total=target.timeout)
         connector = aiohttp.TCPConnector(ssl=target.verify_ssl)
         headers   = {"Content-Type": "application/json", **target.auth_headers}
 
         try:
+            completion_tokens = 0
             async with aiohttp.ClientSession(
                 connector=connector, timeout=timeout
             ) as session:
@@ -390,15 +393,29 @@ def make_victim_fn(
                     if resp.status >= 400:
                         log.warning("Victim API returned HTTP %d", resp.status)
                         return 0
-                    data = await resp.json()
-
-            # Extract completion token count (OpenAI-compatible response)
-            usage = data.get("usage", {})
-            return int(
-                usage.get("completion_tokens")
-                or usage.get("output_tokens")
-                or 0
-            )
+                    # Consume the SSE stream — each incoming chunk keeps the
+                    # connection alive, preventing Cloudflare 524 proxy timeouts.
+                    # The final chunk (stream_options: include_usage) carries
+                    # the authoritative completion_tokens count.
+                    async for raw_line in resp.content:
+                        line = raw_line.decode().strip()
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = _json.loads(data_str)
+                        except Exception:
+                            continue
+                        usage = chunk.get("usage")
+                        if usage:
+                            completion_tokens = int(
+                                usage.get("completion_tokens")
+                                or usage.get("output_tokens")
+                                or completion_tokens
+                            )
+            return completion_tokens
         except Exception as exc:
             log.warning("victim_fn error: %s", exc, exc_info=True)
             return 0
@@ -516,6 +533,7 @@ class ThinkTrapAPG:
             mean  = np.zeros(cfg.latent_dim),
             sigma = cfg.cmaes_sigma,
             seed  = self.seed,
+            population_size=16,
         )
         queries = 0
 

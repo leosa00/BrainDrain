@@ -1,0 +1,7 @@
+{
+  "baseline_itl_ms": 2038.3621952030808,
+  "baseline_ttft_s": 2.0383621952030806,
+  "target_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+  "model": "gemini-2.5-flash",
+  "saved_at": "2026-04-10T13:40:04.608029+00:00"
+}
