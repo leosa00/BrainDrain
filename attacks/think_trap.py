@@ -779,9 +779,13 @@ class ThinkTrapAttack(BaseAttack):
 
         # Some providers embed usage in the last content chunk
         if "usage" in data:
-            usage = data["usage"]
-            result.token_metrics.prompt_tokens     = usage.get("prompt_tokens", 0)
-            result.token_metrics.completion_tokens = usage.get("completion_tokens", 0)
+            usage = data["usage"] or {}
+            result.token_metrics.prompt_tokens     = usage.get("prompt_tokens", 0) or result.token_metrics.prompt_tokens
+            result.token_metrics.completion_tokens = usage.get("completion_tokens", 0) or result.token_metrics.completion_tokens
+            details = usage.get("completion_tokens_details") or {}
+            rt = details.get("reasoning_tokens", 0)
+            if rt:
+                result.token_metrics.reasoning_tokens = rt
 
         content = delta.get("content") or delta.get("reasoning_content")
         if self.tt_config.verbose_stream and content:

@@ -89,6 +89,11 @@ class AttackConfig:
     max_tokens: int     = 8192            # requested max_tokens / max_completion_tokens
     temperature: float  = 0.0             # determinism for reproducibility
     stream: bool        = True            # enables ITL measurement
+    # Seconds to sleep after reading each streaming chunk.
+    # Slows client-side consumption, keeping the HTTP connection open longer
+    # and backing up the server's output queue — extends effective KV block
+    # occupancy beyond pure generation time on servers that flow-control sends.
+    stream_read_delay_s: float = 0.0
     request_id: str     = field(default_factory=lambda: str(uuid.uuid4()))
     tag: Optional[str]  = None            # label for reporting (e.g. "reasoning_bomb_v1")
     metadata: dict      = field(default_factory=dict)
@@ -306,43 +311,65 @@ class BaseAttack(ABC):
         result: AttackResult,
         t_start: float,
     ) -> AttackResult:
-        """Read SSE stream, record TTFT and per-token ITL."""
+        """Read SSE stream, record TTFT and per-token ITL.
+
+        Uses try/finally so partial token counts and latency data are always
+        saved — even when the stream is cut short by a timeout or cancellation.
+        This means TIMEOUT results carry the tokens received up to the cut-off.
+        """
         t_last        = t_start
         t_first_token = None
         full_text     = []
 
-        async for raw_line in response.content:
-            line = raw_line.decode("utf-8").strip()
-            if not line or not line.startswith("data:"):
-                continue
+        try:
+            async for raw_line in response.content:
+                line = raw_line.decode("utf-8").strip()
+                if not line or not line.startswith("data:"):
+                    continue
 
-            data_str = line[len("data:"):].strip()
-            if data_str == "[DONE]":
-                break
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    break
 
-            t_now = time.perf_counter()
+                t_now = time.perf_counter()
 
-            result.metadata["_t_now"]    = t_now
-            result.metadata["_t_start"]  = t_start
+                result.metadata["_t_now"]   = t_now
+                result.metadata["_t_start"] = t_start
 
-            delta = self.parse_stream_chunk(data_str, result)
+                delta = self.parse_stream_chunk(data_str, result)
 
-            if delta is not None:
-                if t_first_token is None:
-                    t_first_token = t_now
-                result.latency_metrics.inter_token_latencies.append(t_now - t_last)
-                full_text.append(delta)
-                t_last = t_now
+                if delta is not None:
+                    if t_first_token is None:
+                        t_first_token = t_now
+                    result.latency_metrics.inter_token_latencies.append(t_now - t_last)
+                    full_text.append(delta)
+                    t_last = t_now
 
+                if self.config.stream_read_delay_s > 0:
+                    await asyncio.sleep(self.config.stream_read_delay_s)
 
-        result.latency_metrics.total_duration_s = time.perf_counter() - t_start
-        if t_first_token is not None:
-            result.latency_metrics.ttft_s = t_first_token - t_start
-        # Fallback: if the usage chunk wasn't sent, count ITL entries as tokens
-        if result.token_metrics.completion_tokens == 0:
-            result.token_metrics.completion_tokens = len(result.latency_metrics.inter_token_latencies)
-        result.raw_response = "".join(full_text)
-        result.status       = AttackStatus.SUCCESS
+        finally:
+            # Always save latency + partial text regardless of how the loop ended.
+            result.latency_metrics.total_duration_s = time.perf_counter() - t_start
+            if t_first_token is not None:
+                result.latency_metrics.ttft_s = t_first_token - t_start
+            result.raw_response = "".join(full_text)
+
+            # Completion token fallback: if no usage chunk arrived (timeout /
+            # truncated stream), use the number of ITL entries we collected.
+            if result.token_metrics.completion_tokens == 0:
+                result.token_metrics.completion_tokens = len(
+                    result.latency_metrics.inter_token_latencies
+                )
+
+            # Reasoning token fallback: parse_stream_chunk implementations
+            # increment _streaming_reasoning_tokens for each reasoning-content
+            # chunk.  Use that count when the final usage chunk never arrived.
+            streaming_rt = result.metadata.pop("_streaming_reasoning_tokens", 0)
+            if result.token_metrics.reasoning_tokens == 0 and streaming_rt > 0:
+                result.token_metrics.reasoning_tokens = streaming_rt
+
+        result.status = AttackStatus.SUCCESS
         return result
 
     # ── Convenience ───────────────────────────

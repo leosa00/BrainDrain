@@ -393,33 +393,48 @@ class ReasoningBombAttack(BaseAttack):
     def _parse_openai_chunk(
         self, data: dict, result: AttackResult
     ) -> Optional[str]:
-        # Final usage chunk (stream_options.include_usage=True)
-        if "usage" in data and data.get("choices") is None:
-            usage = data["usage"]
-            result.token_metrics.prompt_tokens     = usage.get("prompt_tokens", 0)
-            result.token_metrics.completion_tokens = usage.get("completion_tokens", 0)
-            # reasoning_tokens is inside completion_tokens_details for o-series models
-            details = usage.get("completion_tokens_details", {})
-            result.token_metrics.reasoning_tokens  = details.get("reasoning_tokens", 0)
-            return None
+        # Capture usage whenever it appears — vLLM and OpenAI both send it in
+        # the final content chunk (choices present, delta empty, finish_reason
+        # set) as well as in a trailing usage-only chunk (choices absent/null).
+        # The old guard `data.get("choices") is None` missed the vLLM case.
+        usage = data.get("usage")
+        if usage:
+            result.token_metrics.prompt_tokens     = usage.get("prompt_tokens", 0) or result.token_metrics.prompt_tokens
+            result.token_metrics.completion_tokens = usage.get("completion_tokens", 0) or result.token_metrics.completion_tokens
+            details = usage.get("completion_tokens_details") or {}
+            rt = details.get("reasoning_tokens", 0)
+            if rt:
+                result.token_metrics.reasoning_tokens = rt
 
-        choices = data.get("choices", [])
+        choices = data.get("choices") or []
         if not choices:
             return None
+
         delta = choices[0].get("delta", {})
 
-        content = (
-            delta.get("reasoning")        # ← thinking trace
-            or delta.get("content")
-            or delta.get("reasoning_content")
-        )
-        # Some providers embed usage in the last content chunk
-        if "usage" in data:
-            usage = data["usage"]
-            result.token_metrics.prompt_tokens     = usage.get("prompt_tokens", 0)
-            result.token_metrics.completion_tokens = usage.get("completion_tokens", 0)
+        # ── Reasoning trace (thinking tokens) ────────────────────────────────
+        # DeepSeek R1 / vLLM:  delta.reasoning_content
+        # QwQ / Qwen3:         delta.reasoning_content  (same key)
+        # Some providers:      delta.reasoning
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if reasoning:
+            # Record time-to-first-reasoning-token on first chunk
+            if result.latency_metrics.ttfrt_s == 0.0:
+                t_now   = result.metadata.get("_t_now", 0.0)
+                t_start = result.metadata.get("_t_start", 0.0)
+                result.latency_metrics.ttfrt_s = t_now - t_start
+            # Increment streaming counter used as fallback on timeout
+            result.metadata["_streaming_reasoning_tokens"] = (
+                result.metadata.get("_streaming_reasoning_tokens", 0) + 1
+            )
+            if self.rb_config.verbose_stream:
+                print(reasoning, end="", flush=True)
+            # Return None so _consume_stream doesn't count this as a
+            # completion-content token in inter_token_latencies.
+            return None
 
-        content = delta.get("content") or delta.get("reasoning_content")
+        # ── Regular content ───────────────────────────────────────────────────
+        content = delta.get("content")
         if self.rb_config.verbose_stream and content:
             print(content, end="", flush=True)
         return content if content else None

