@@ -209,6 +209,9 @@ class ProbeConfig:
     baseline_window:     int   = 5
     baseline_itl_ms:     float = 0.0   # populated after calibrate_baseline()
     baseline_ttft_s:     float = 0.0
+    baseline_kv_est:      float = 0.0   # idle-state KV estimate (normalisation floor)
+    baseline_kv_n:        int   = 3     # number of KV samples taken during calibration
+    baseline_pure_itl_ms: float = 0.0   # idle-state mean ITL excluding TTFT (decode-only)
 
     # Burst probe
     burst_concurrency:   int   = 4
@@ -433,9 +436,11 @@ class ITLProbes:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         data = {
-            "baseline_itl_ms": self.config.baseline_itl_ms,
-            "baseline_ttft_s": self.config.baseline_ttft_s,
-            "target_url":      self.config.target.base_url,
+            "baseline_itl_ms":      self.config.baseline_itl_ms,
+            "baseline_ttft_s":      self.config.baseline_ttft_s,
+            "baseline_kv_est":      self.config.baseline_kv_est,
+            "baseline_pure_itl_ms": self.config.baseline_pure_itl_ms,
+            "target_url":           self.config.target.base_url,
             "model":           self.config.target.model,
             "saved_at":        datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
@@ -451,12 +456,14 @@ class ITLProbes:
             data = json.loads(p.read_text())
             self.config.baseline_itl_ms = float(data["baseline_itl_ms"])
             self.config.baseline_ttft_s = float(data["baseline_ttft_s"])
+            self.config.baseline_kv_est      = float(data.get("baseline_kv_est", 0.0))
+            self.config.baseline_pure_itl_ms = float(data.get("baseline_pure_itl_ms", 0.0))
             self.estimator.set_baseline(self.config.baseline_itl_ms)
             self._baseline_calibrated = True
             logger.info(
-                "Baseline loaded from %s  (itl=%.3f ms, ttft=%.4f s, saved %s)",
+                "Baseline loaded from %s  (itl=%.3f ms, ttft=%.4f s, kv=%.4f, saved %s)",
                 path, self.config.baseline_itl_ms, self.config.baseline_ttft_s,
-                data.get("saved_at", "?"),
+                self.config.baseline_kv_est, data.get("saved_at", "?"),
             )
             return True
         except Exception as exc:
@@ -533,8 +540,13 @@ class ITLProbes:
     # ── Payload construction ──────────────────────────────────────────────────
 
     def _build_payload(self, prompt: str, max_tokens: int, stream: bool = True) -> dict:
-        fmt  = self.config.target.api_format
-        msgs = [{"role": "user", "content": prompt}]
+        fmt = self.config.target.api_format
+        sp  = self.config.target.system_prompt
+        msgs = []
+        if sp and fmt != APIFormat.ANTHROPIC:
+            msgs.append({"role": "system", "content": sp})
+        msgs.append({"role": "user", "content": prompt})
+
         base: dict[str, Any] = {
             "model":       self.config.target.model,
             "temperature": self.config.temperature,
@@ -550,6 +562,8 @@ class ITLProbes:
         elif fmt == APIFormat.ANTHROPIC:
             base["messages"]   = msgs
             base["max_tokens"] = max_tokens
+            if sp:
+                base["system"] = sp
 
         elif fmt == APIFormat.OLLAMA:
             base["messages"] = msgs
@@ -742,13 +756,46 @@ class ITLProbes:
         self.estimator.set_baseline(self.config.baseline_itl_ms)
         self._baseline_calibrated = True
 
+        # ── Pure ITL baseline (decode-only, TTFT excluded) ────────────────────
+        # itl_values[0] = TTFT; itl_values[1:] = true inter-token intervals.
+        # We keep a separate baseline for these so _kv_estimate can compare
+        # apples-to-apples when computing the unsupervised KV pressure signal.
+        pure_itl_means: List[float] = []
+        for r in samples:
+            if r.success and len(r.itl_values) > 1:
+                pure_ms = [v * 1000.0 for v in r.itl_values[1:]]
+                pure_itl_means.append(statistics.mean(pure_ms))
+        self.config.baseline_pure_itl_ms = (
+            statistics.mean(pure_itl_means) if pure_itl_means
+            else self.config.baseline_itl_ms  # fallback: use full mean
+        )
+
+        # ── KV baseline: measure idle-state KV estimate ──────────────────────
+        # These probes run *after* baseline_itl_ms is set, so the estimator
+        # uses it for normalisation.  The resulting values represent the
+        # "floor" — the non-zero KV estimate that corresponds to an idle server.
+        # All subsequent single_probe() calls subtract this floor so that
+        # idle → 0.0 and fully saturated → 1.0.
+        kv_raw_samples: List[float] = []
+        for _ in range(self.config.baseline_kv_n):
+            r = await self.single_probe()
+            if r.success and r.kv_usage_est >= 0:
+                kv_raw_samples.append(r.kv_usage_est)
+            await asyncio.sleep(inter_delay_s)
+
+        self.config.baseline_kv_est = (
+            statistics.mean(kv_raw_samples) if kv_raw_samples else 0.0
+        )
+
         result = {
-            "calibrated":       True,
-            "n_samples":        len(samples),
-            "baseline_itl_ms":  round(self.config.baseline_itl_ms, 3),
-            "baseline_ttft_s":  round(self.config.baseline_ttft_s, 4),
-            "itl_stddev_ms":    round(statistics.stdev(itl_vals) if len(itl_vals) > 1 else 0, 3),
-            "ttft_stddev_s":    round(statistics.stdev(ttft_vals) if len(ttft_vals) > 1 else 0, 4),
+            "calibrated":            True,
+            "n_samples":             len(samples),
+            "baseline_itl_ms":       round(self.config.baseline_itl_ms, 3),
+            "baseline_pure_itl_ms":  round(self.config.baseline_pure_itl_ms, 3),
+            "baseline_ttft_s":       round(self.config.baseline_ttft_s, 4),
+            "baseline_kv_est":       round(self.config.baseline_kv_est, 4),
+            "itl_stddev_ms":         round(statistics.stdev(itl_vals) if len(itl_vals) > 1 else 0, 3),
+            "ttft_stddev_s":         round(statistics.stdev(ttft_vals) if len(ttft_vals) > 1 else 0, 4),
         }
         logger.info("Baseline calibrated: %s", result)
         if self.config.baseline_cache_path:
@@ -777,7 +824,7 @@ class ITLProbes:
         t = max_tokens or self.config.max_probe_tokens
         result = await self._stream_probe(p, t, probe_type="single")
         if result.success:
-            result.kv_usage_est = self.estimator.estimate(
+            result.kv_usage_est = self._kv_estimate(
                 [v * 1000.0 for v in result.itl_values]
             )
             self._itl_history.append(result)
@@ -816,7 +863,7 @@ class ITLProbes:
                 for r in individual if r.success
                 for v in r.itl_values
             ]
-            burst.kv_usage_est = self.estimator.estimate(all_itl_ms)
+            burst.kv_usage_est = self._kv_estimate(all_itl_ms)
 
         return burst
 
@@ -956,7 +1003,7 @@ class ITLProbes:
         for i in range(n_probes):
             r = await self._stream_probe(p, t, probe_type="pressure_scan")
             if r.success:
-                r.kv_usage_est = self.estimator.estimate(
+                r.kv_usage_est = self._kv_estimate(
                     [v * 1000.0 for v in r.itl_values]
                 )
             results.append(r)
@@ -968,6 +1015,47 @@ class ITLProbes:
     # ═════════════════════════════════════════════════════════════════════════
     # 7. estimate_kv_usage
     # ═════════════════════════════════════════════════════════════════════════
+
+    def _kv_estimate(self, itl_ms: List[float]) -> float:
+        """
+        Compute a normalised KV pressure estimate from an ITL sequence.
+
+        itl_ms[0] is the TTFT (time-to-first-token), which rises under HOL
+        blocking (request queuing) but is *not* a direct KV pressure signal.
+        itl_ms[1:] are the true inter-token intervals from the decode phase,
+        which rise proportionally to GPU memory-bandwidth contention.
+
+        We compare the mean of the decode-only intervals (itl_ms[1:]) against
+        baseline_pure_itl_ms (calibrated from idle-state decode intervals) so
+        that TTFT spikes from queue buildup don't inflate the KV estimate.
+
+        If a trained ML model is available we fall back to it using the full
+        sequence (it was trained with TTFT-inclusive features).
+
+        Normalisation floor: baseline_kv_est shifts idle → 0.0.
+        """
+        if not itl_ms:
+            return 0.0
+
+        if self.estimator._trained and self.estimator._model is not None:
+            # Supervised model: use full sequence (trained on same feature set)
+            raw = self.estimator.estimate(itl_ms)
+        else:
+            # Unsupervised: use decode-only ITL to avoid TTFT contamination
+            pure = itl_ms[1:] if len(itl_ms) > 1 else itl_ms
+            bpure = max(self.config.baseline_pure_itl_ms, 1e-6)
+            mean_pure = float(np.mean(pure))
+            ratio = (mean_pure - bpure) / bpure
+            soft  = ratio / (1.0 + abs(ratio))
+            raw   = float(np.clip(soft, 0.0, 1.0))
+
+        bkv = self.config.baseline_kv_est
+        if bkv > 0.0:
+            return float(np.clip(
+                (raw - bkv) / max(1.0 - bkv, 1e-6),
+                0.0, 1.0,
+            ))
+        return raw
 
     async def estimate_kv_usage(self) -> float:
         """Single-probe KV cache utilisation estimate: Û_sys ∈ [0.0, 1.0]."""

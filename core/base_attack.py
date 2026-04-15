@@ -53,6 +53,10 @@ class TargetConfig:
     # NEW: set False for any endpoint that rejects OpenAI stream_options
     # (Ollama /v1 shim, LM Studio older builds, some Azure deployments)
     supports_stream_options: bool = True
+    # Optional system prompt sent with every request to this target.
+    # Useful for prefix-aware routing: a shared prefix pins all concurrent
+    # requests to the same KV-cache / GPU worker.
+    system_prompt: Optional[str] = None
 
     @property
     def endpoint(self) -> str:

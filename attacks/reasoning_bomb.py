@@ -264,13 +264,15 @@ class ReasoningBombAttack(BaseAttack):
             # CUSTOM: fall back to OpenAI schema
             return self._openai_payload(puzzle)
 
+    def _effective_system_prompt(self) -> Optional[str]:
+        """Attack-level system prompt takes precedence over target-level."""
+        return self.rb_config.system_prompt or self.config.target.system_prompt
+
     def _build_messages(self, puzzle: str) -> list[dict]:
         messages = []
-        if self.rb_config.system_prompt:
-            messages.append({
-                "role": "system",
-                "content": self.rb_config.system_prompt,
-            })
+        sp = self._effective_system_prompt()
+        if sp:
+            messages.append({"role": "system", "content": sp})
         messages.append({"role": "user", "content": puzzle})
         return messages
 
@@ -282,21 +284,20 @@ class ReasoningBombAttack(BaseAttack):
             "temperature": self.config.temperature,
             "stream":      self.config.stream,
         }
-        if self.config.stream:
-            # Request token-level usage in the final stream chunk (OpenAI >=1.x)
+        if self.config.stream and self.config.target.supports_stream_options:
             payload["stream_options"] = {"include_usage": True}
         return payload
 
     def _anthropic_payload(self, puzzle: str) -> dict[str, Any]:
-        messages = [{"role": "user", "content": puzzle}]
         payload: dict[str, Any] = {
             "model":      self.config.target.model,
-            "messages":   messages,
+            "messages":   [{"role": "user", "content": puzzle}],
             "max_tokens": self.config.max_tokens,
             "stream":     self.config.stream,
         }
-        if self.rb_config.system_prompt:
-            payload["system"] = self.rb_config.system_prompt
+        sp = self._effective_system_prompt()
+        if sp:
+            payload["system"] = sp
         return payload
 
     def _ollama_payload(self, puzzle: str) -> dict[str, Any]:

@@ -1,7 +1,9 @@
 {
-  "baseline_itl_ms": 2038.3621952030808,
-  "baseline_ttft_s": 2.0383621952030806,
-  "target_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-  "model": "gemini-2.5-flash",
-  "saved_at": "2026-04-10T13:40:04.608029+00:00"
+  "baseline_itl_ms": 276.86847399454564,
+  "baseline_ttft_s": 0.2768684739945456,
+  "baseline_kv_est": 0.0,
+  "baseline_pure_itl_ms": 276.86847399454564,
+  "target_url": "https://tq6t2k63ed4mdv-8000.proxy.runpod.net",
+  "model": "deepseek-r1-7b",
+  "saved_at": "2026-04-15T09:26:48.087030+00:00"
 }

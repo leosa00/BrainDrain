@@ -682,10 +682,15 @@ class ThinkTrapAttack(BaseAttack):
         else:  # CUSTOM — fall back to OpenAI schema
             return self._openai_payload(prompt_text)
 
+    def _effective_system_prompt(self) -> Optional[str]:
+        """Attack-level system prompt takes precedence over target-level."""
+        return self.tt_config.system_prompt or self.config.target.system_prompt
+
     def _build_messages(self, prompt: str) -> list[dict]:
         messages = []
-        if self.tt_config.system_prompt:
-            messages.append({"role": "system", "content": self.tt_config.system_prompt})
+        sp = self._effective_system_prompt()
+        if sp:
+            messages.append({"role": "system", "content": sp})
         messages.append({"role": "user", "content": prompt})
         return messages
 
@@ -708,8 +713,9 @@ class ThinkTrapAttack(BaseAttack):
             "max_tokens": self.config.max_tokens,
             "stream":     self.config.stream,
         }
-        if self.tt_config.system_prompt:
-            payload["system"] = self.tt_config.system_prompt
+        sp = self._effective_system_prompt()
+        if sp:
+            payload["system"] = sp
         return payload
 
     def _ollama_payload(self, prompt: str) -> dict[str, Any]:

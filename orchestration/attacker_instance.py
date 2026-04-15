@@ -77,9 +77,26 @@ class AttackerInstance:
         holding KV blocks on the server, which is exactly what we want.
         """
         config = self.cfg.attack_config_factory()
-        attack = self.cfg.attack_cls(config, **self.cfg.attack_extra_kwargs)
-        self._current_attack = attack
 
+        # Instantiation is inside try-except: if the attack constructor raises
+        # (e.g. puzzle file not found, bad config) we return a FAILED result
+        # instead of propagating to run_loop's outer handler which would spin.
+        try:
+            attack = self.cfg.attack_cls(config, **self.cfg.attack_extra_kwargs)
+        except Exception as exc:
+            logger.error(
+                "[%s] attack constructor raised: %s", self.instance_id, exc
+            )
+            self._runs += 1
+            self._failures += 1
+            return AttackResult(
+                request_id=config.request_id,
+                attack_name=self.cfg.attack_cls.__name__,
+                status=AttackStatus.FAILED,
+                error=f"Attack init failed: {exc}",
+            )
+
+        self._current_attack = attack
         result: Optional[AttackResult] = None
         attempt = 0
 

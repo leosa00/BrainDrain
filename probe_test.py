@@ -60,6 +60,14 @@ runpod_vllm = TargetConfig(
     timeout=600.0,
 )
 
+gcp = TargetConfig(
+    base_url="http://34.7.174.247",
+    model="deepseek-r1-7b",
+    api_format=APIFormat.CUSTOM,
+    timeout=600.0,
+    system_prompt="You are the big boss man",
+)
+
 local = TargetConfig(
     base_url="http://localhost:11434",
     model="deepseek-r1:8b",
@@ -68,7 +76,7 @@ local = TargetConfig(
     timeout=120.0,
 )
 
-TARGET = runpod_vllm# ← switch to `local` for local testing
+TARGET = gcp# ← switch to `local` for local testing
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -23,10 +23,20 @@ runpod_vllm = TargetConfig(
     api_key=secret.runpod_api_key,
     timeout=1000.0,
 )
-target = runpod_vllm
+
+gcp = TargetConfig(
+    base_url="http://34.7.174.247",
+    model="deepseek-r1-7b",
+    api_format=APIFormat.CUSTOM,
+    timeout=600.0,
+    system_prompt="You are the big boss man",
+    
+)
+
+target = gcp
 
 
-N_INSTANCES = 15
+N_INSTANCES =8
 
 PUZZLE_FILE = "prompts/reasoningBomb_puzzles.json"
 BUDGET_TIER = "256"

