@@ -1,9 +1,9 @@
 {
-  "baseline_itl_ms": 42.195135611109436,
-  "baseline_ttft_s": 0.042195135611109436,
-  "baseline_kv_est": 0.11678209087380483,
-  "baseline_pure_itl_ms": 42.195135611109436,
-  "target_url": "http://34.7.174.247",
+  "baseline_itl_ms": 40.95474660862237,
+  "baseline_ttft_s": 0.040954746608622375,
+  "baseline_kv_est": 0.023027822003619733,
+  "baseline_pure_itl_ms": 40.95474660862237,
+  "target_url": "http://34.6.205.17",
   "model": "qwen3-14b",
-  "saved_at": "2026-04-15T14:27:31.326587+00:00"
+  "saved_at": "2026-04-16T08:46:23.443786+00:00"
 }

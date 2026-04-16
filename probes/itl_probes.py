@@ -1300,34 +1300,38 @@ class ITLProbes:
         ratios   = [p["ratio"] for p in pairs]
         median_ratio = sorted(ratios)[len(ratios) // 2]
 
-        # Estimate backend count
-        if hit_rate > 0:
-            est_backends: Any = max(1, round(1.0 / hit_rate))
+        # Determine if probes are consistently hitting the same backend.
+        # A cache hit means the second request in a pair found its KV prefix
+        # already cached — only possible when both requests land on the same
+        # server with APC enabled.  High hit rate → consistent same-backend routing.
+        #
+        # NOTE: a single server and a prefix-aware load balancer are
+        # indistinguishable here — both produce consistent cache hits for
+        # same-prefix pairs, because prefix-aware routing is designed to pin
+        # same-prefix traffic to the same backend.
+        if hit_rate >= 0.70:
+            same_backend = True
+            confidence   = "high" if hit_rate >= 0.85 else "medium"
+            verdict      = "single server or prefix-aware routing (cannot distinguish)"
+        elif hit_rate <= 0.30:
+            same_backend = False
+            confidence   = "high" if hit_rate <= 0.15 else "medium"
+            verdict      = "load balanced — requests hit different backends"
         else:
-            est_backends = f">{len(pairs)}"
-
-        # Verdict
-        if hit_rate >= 0.8:
-            verdict = "single_server"
-        elif hit_rate >= 0.4:
-            verdict = "load_balanced_2_backends"
-        elif hit_rate > 0.0:
-            verdict = "load_balanced"
-        else:
-            # Zero cache hits: either many backends, or APC is disabled.
-            # With the long prompt, APC-disabled would still show near-1.0
-            # ratios; many backends would show ratios scattered around 1.0.
-            verdict = "load_balanced_or_apc_disabled"
+            same_backend = False
+            confidence   = "low"
+            verdict      = "ambiguous — inconsistent routing detected"
 
         return {
-            "success":            True,
-            "n_pairs":            len(pairs),
-            "n_cache_hits":       n_hits,
-            "cache_hit_rate":     round(hit_rate, 3),
-            "median_ttft_ratio":  round(median_ratio, 3),
-            "estimated_backends": est_backends,
-            "verdict":            verdict,
-            "pairs":              pairs,
+            "success":           True,
+            "n_pairs":           len(pairs),
+            "n_cache_hits":      n_hits,
+            "cache_hit_rate":    round(hit_rate, 3),
+            "median_ttft_ratio": round(median_ratio, 3),
+            "same_backend":      same_backend,
+            "confidence":        confidence,
+            "verdict":           verdict,
+            "pairs":             pairs,
         }
 
     # ═════════════════════════════════════════════════════════════════════════

@@ -61,8 +61,8 @@ runpod_vllm = TargetConfig(
 )
 
 gcp = TargetConfig(
-    base_url="http://34.7.174.247",
-    model="deepseek-r1-7b",
+    base_url="http://34.6.205.17",
+    model="qwen3-14b",
     api_format=APIFormat.CUSTOM,
     timeout=600.0,
     system_prompt="You are the big boss man",
@@ -310,11 +310,13 @@ async def suite_lb(probes: ITLProbes) -> None:
         print(f"  error: {result.get('error')}")
         return
 
+    print(f"  same_backend      : {result['same_backend']}")
+    print(f"  confidence        : {result['confidence']}")
     print(f"  verdict           : {result['verdict']}")
-    print(f"  estimated_backends: {result['estimated_backends']}")
     print(f"  cache_hit_rate    : {result['cache_hit_rate']:.1%}  "
           f"({result['n_cache_hits']}/{result['n_pairs']} pairs)")
-    print(f"  median_ttft_ratio : {result['median_ttft_ratio']:.3f}×")
+    print(f"  median_ttft_ratio : {result['median_ttft_ratio']:.3f}×  "
+          f"(warm/cold — lower = stronger cache hit)")
     print()
     print(f"  {'pair':<5s} {'ttft_cold_s':>11s} {'ttft_warm_s':>11s} "
           f"{'ratio':>7s} {'hit':>5s}")

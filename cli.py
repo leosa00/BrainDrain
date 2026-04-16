@@ -73,7 +73,17 @@ def _ask(prompt: str, default: Optional[str] = None) -> str:
     """Prompt the user; return stripped input or default if blank."""
     suffix = f" [{default}]" if default is not None else ""
     try:
-        val = input(f"  {prompt}{suffix}: ").strip()
+        if _RICH and console:
+            from rich.markup import escape as _escape
+            # Print the prompt via console.print so Rich markup in `prompt`
+            # (e.g. [bold]256[/bold] from _choose) is rendered correctly.
+            # The default is escaped so brackets in file paths aren't parsed
+            # as markup tags.  Plain input("") then reads the response.
+            safe_suffix = f" \\[{_escape(default)}]" if default is not None else ""
+            console.print(f"  {prompt}{safe_suffix}: ", end="")
+            val = input("").strip()
+        else:
+            val = input(f"  {prompt}{suffix}: ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         sys.exit(0)
@@ -228,7 +238,7 @@ async def try_fetch_context_length(target: TargetConfig) -> Optional[int]:
 # ─────────────────────────────────────────────
 
 def gather_target_config() -> TargetConfig:
-    _print("\n[bold cyan]── Target Configuration ──[/bold cyan]" if _RICH else "\n── Target Configuration ──")
+    _print("\n[bold #8B0000]── Target Configuration ──[/bold #8B0000]" if _RICH else "\n── Target Configuration ──")
 
     base_url = _ask("Target URL / IP (e.g. http://1.2.3.4 or https://api.example.com)")
     if not base_url.startswith("http"):
@@ -259,18 +269,6 @@ def gather_target_config() -> TargetConfig:
         raw = _ask("Server supports stream_options (OpenAI >=1.x)? (y/n)", "y")
         supports_stream_options = raw.lower().startswith("y")
 
-    _print(
-        "\n  [dim]System prompt — sent with every attack request. "
-        "A shared prefix pins concurrent requests to the same KV-cache slot, "
-        "maximising cache pressure (prefix-aware routing). Leave blank to omit.[/dim]"
-        if _RICH else
-        "\n  System prompt — sent with every attack request. A shared prefix pins "
-        "concurrent requests to the same KV-cache slot (prefix-aware routing). "
-        "Leave blank to omit."
-    )
-    system_prompt_raw = _ask("System prompt (leave blank to omit)")
-    system_prompt = system_prompt_raw if system_prompt_raw else None
-
     return TargetConfig(
         base_url=base_url,
         model=model,
@@ -278,7 +276,6 @@ def gather_target_config() -> TargetConfig:
         api_key=api_key,
         timeout=timeout_s,
         supports_stream_options=supports_stream_options,
-        system_prompt=system_prompt,
     )
 
 
@@ -323,7 +320,7 @@ def _estimate_prompt_tokens(attack_type: str, extra: dict) -> int:
 
 
 def gather_attack_params(target: TargetConfig) -> dict:
-    _print("\n[bold cyan]── Attack Configuration ──[/bold cyan]" if _RICH else "\n── Attack Configuration ──")
+    _print("\n[bold #8B0000]── Attack Configuration ──[/bold #8B0000]" if _RICH else "\n── Attack Configuration ──")
 
     attack_type = _choose(
         "Attack type",
@@ -399,7 +396,7 @@ def gather_attack_params(target: TargetConfig) -> dict:
 
     # ── Sustained pressure options ────────────────────────────────────────────
     _print(
-        "\n[bold cyan]── Sustained Pressure Options ──[/bold cyan]\n"
+        "\n[bold #8B0000]── Sustained Pressure Options ──[/bold #8B0000]\n"
         "  These settings prevent simultaneous request completion (wave pattern)\n"
         "  which would briefly free the KV cache and let the scheduler recover.\n"
         if _RICH else
@@ -456,6 +453,116 @@ async def _fetch_context_length_safe(target: TargetConfig) -> Optional[int]:
         return await try_fetch_context_length(target)
     except Exception:
         return None
+
+
+# ─────────────────────────────────────────────
+# Load balancer test
+# ─────────────────────────────────────────────
+
+async def _run_lb_test(target: TargetConfig) -> None:
+    """Run a load-balancer detection test and print results."""
+    _print(
+        "\n[bold #8B0000]── Load Balancer Detection ──[/bold #8B0000]"
+        if _RICH else
+        "\n── Load Balancer Detection ──"
+    )
+    _print(
+        "  Sends pairs of identical long-prefix requests and checks whether\n"
+        "  the second request gets an APC cache hit (TTFT drops significantly).\n"
+        "  Consistent hits → same backend every time.\n"
+        "  Few/no hits    → requests route to different backends.\n"
+        if _RICH else
+        "  Sends pairs of identical long-prefix requests and checks whether\n"
+        "  the second request gets an APC cache hit (TTFT drops significantly).\n"
+        "  Consistent hits → same backend every time.\n"
+        "  Few/no hits    → requests route to different backends.\n"
+    )
+
+    n_pairs = _ask_int("Number of probe pairs", default=6)
+    prompt_repeats = _ask_int(
+        "Prompt repeat factor (higher = longer prefix, more visible cache hits)", default=12
+    )
+
+    cfg = ProbeConfig(
+        target=target,
+        max_probe_tokens=128,
+        temperature=0.0,
+    )
+    probes = ITLProbes(cfg)
+
+    _print("  Running warm-up requests…" if not _RICH else "  [dim]Running warm-up requests…[/dim]")
+    try:
+        result = await probes.load_balancer_probe(
+            n_pairs=n_pairs,
+            inter_pair_delay_s=0.5,
+            n_warmup=3,
+            prompt_repeats=prompt_repeats,
+        )
+    finally:
+        await probes.close()
+
+    if not result["success"]:
+        _print(
+            f"  [bold red]LB test failed: {result.get('error')}[/bold red]"
+            if _RICH else
+            f"  LB test failed: {result.get('error')}"
+        )
+        return
+
+    hit_rate   = result["cache_hit_rate"]
+    same       = result["same_backend"]
+    confidence = result["confidence"]
+    verdict    = result["verdict"]
+    med_ratio  = result["median_ttft_ratio"]
+
+    verdict_style = "green" if same else "red"
+    _print(
+        f"\n  [bold {verdict_style}]Verdict: {verdict}[/bold {verdict_style}]\n"
+        f"  Cache hit rate    : {hit_rate:.1%}  ({result['n_cache_hits']}/{result['n_pairs']} pairs)\n"
+        f"  Median TTFT ratio : {med_ratio:.3f}×  (warm/cold — lower = stronger cache hit)\n"
+        f"  Confidence        : {confidence}\n"
+        if _RICH else
+        f"\n  Verdict           : {verdict}\n"
+        f"  Cache hit rate    : {hit_rate:.1%}  ({result['n_cache_hits']}/{result['n_pairs']} pairs)\n"
+        f"  Median TTFT ratio : {med_ratio:.3f}×  (warm/cold — lower = stronger cache hit)\n"
+        f"  Confidence        : {confidence}\n"
+    )
+
+    if same:
+        _print(
+            "  [bold green]Tip: set a system prompt to pin all attack and probe requests\n"
+            "  to the same KV-cache slot via prefix-aware routing — this maximises\n"
+            "  cache pressure on a single backend.[/bold green]"
+            if _RICH else
+            "  Tip: set a system prompt to pin all attack and probe requests\n"
+            "  to the same KV-cache slot via prefix-aware routing — this maximises\n"
+            "  cache pressure on a single backend."
+        )
+
+    if _RICH:
+        t = Table.grid(padding=(0, 2))
+        t.add_column(style="dim", width=6)
+        t.add_column(justify="right", width=11)
+        t.add_column(justify="right", width=11)
+        t.add_column(justify="right", width=7)
+        t.add_column(justify="center", width=5)
+        console.print("  pair  cold_ttft   warm_ttft   ratio  hit", style="dim")
+        for p in result["pairs"]:
+            hit_text = Text("yes", style="green") if p["cache_hit"] else Text("no", style="red")
+            t.add_row(
+                str(p["pair"]),
+                f"{p['ttft_cold_s']:.4f}s",
+                f"{p['ttft_warm_s']:.4f}s",
+                f"{p['ratio']:.3f}×",
+                hit_text,
+            )
+        console.print(t)
+    else:
+        print(f"  {'pair':<5s} {'cold_ttft':>10s} {'warm_ttft':>10s} {'ratio':>7s} {'hit':>5s}")
+        print(f"  {'─'*5} {'─'*10} {'─'*10} {'─'*7} {'─'*5}")
+        for p in result["pairs"]:
+            print(f"  {p['pair']:<5d} {p['ttft_cold_s']:>10.4f} {p['ttft_warm_s']:>10.4f} "
+                  f"{p['ratio']:>7.3f} {'yes' if p['cache_hit'] else 'no':>5s}")
 
 
 # ─────────────────────────────────────────────
@@ -586,7 +693,7 @@ class StatusDisplay:
                     # Truncate to fit panel width
                     short = self._last_error[:60] + ("…" if len(self._last_error) > 60 else "")
                     t.add_row("Last error", Text(short, style="red dim"))
-            return Panel(t, title="[bold]BrainDrain[/bold]", border_style="cyan")
+            return Panel(t, title="[bold]BrainDrain[/bold]", border_style="#8B0000")
         else:
             err_str = f" err={self._errors}" if self._errors else ""
             print(
@@ -796,7 +903,7 @@ class AttackOrchestrator:
     # ── Baseline calibration ──────────────────────────────────────────
 
     async def run_baseline(self) -> None:
-        _print("\n[bold cyan]── Baseline Calibration ──[/bold cyan]" if _RICH
+        _print("\n[bold #8B0000]── Baseline Calibration ──[/bold #8B0000]" if _RICH
                else "\n── Baseline Calibration ──")
         _print("  Running 5 probe requests against idle server…")
 
@@ -887,12 +994,8 @@ class AttackOrchestrator:
             )
             self._collector.record_state(state)
 
-        def on_state_change(old: InfraState, new: InfraState) -> None:
-            _print(
-                f"\n  [bold]State change: {old.value} → {new.value}[/bold]"
-                if _RICH else
-                f"\n  State change: {old.value} → {new.value}"
-            )
+        def on_state_change(__old: InfraState, __new: InfraState) -> None:
+            pass
 
         await self._probes.monitor(
             interval_s=self.PROBE_INTERVAL_S,
@@ -1158,9 +1261,21 @@ class AttackOrchestrator:
         stagger_str    = f"{self.launch_stagger_s:.2f}s" if self.launch_stagger_s > 0 else "off"
         spread_str     = f"±{self.max_tokens_spread_pct:.0f}%" if self.max_tokens_spread_pct > 0 else "off"
         read_delay_str = f"{self.stream_read_delay_s*1000:.0f} ms/chunk" if self.stream_read_delay_s > 0 else "off"
+        puzzle_file    = self.attack_extra.get("puzzle_file", "")
+        budget_tier    = self.attack_extra.get("budget_tier", "")
+        prompts_file   = self.attack_extra.get("prompts_file", "")
+        extra_lines = ""
+        if self.attack_type == "reasoning_bomb" and puzzle_file:
+            extra_lines = (
+                f"  Puzzle file     : {puzzle_file}\n"
+                f"  Budget tier     : {budget_tier}\n"
+            )
+        elif self.attack_type == "think_trap" and prompts_file:
+            extra_lines = f"  Prompts file    : {prompts_file}\n"
         _print(
-            f"\n[bold cyan]── Launching Attack ──[/bold cyan]\n"
+            f"\n[bold #8B0000]── Launching Attack ──[/bold #8B0000]\n"
             f"  Type            : {self.attack_type}\n"
+            f"{extra_lines}"
             f"  Instances       : {self.n_instances}\n"
             f"  Max tokens      : {self.max_tokens:,} per request\n"
             f"  Token spread    : {spread_str}\n"
@@ -1172,6 +1287,7 @@ class AttackOrchestrator:
             if _RICH else
             f"\n── Launching Attack ──\n"
             f"  Type            : {self.attack_type}\n"
+            f"{extra_lines}"
             f"  Instances       : {self.n_instances}\n"
             f"  Max tokens      : {self.max_tokens:,} per request\n"
             f"  Token spread    : {spread_str}\n"
@@ -1246,11 +1362,11 @@ class AttackOrchestrator:
 
     def _print_summary(self, result: Any) -> None:
         _print(
-            "\n[bold cyan]── Attack Summary ──[/bold cyan]" if _RICH
+            "\n[bold #8B0000]── Attack Summary ──[/bold #8B0000]" if _RICH
             else "\n── Attack Summary ──"
         )
         if _RICH:
-            t = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+            t = Table(box=box.SIMPLE, show_header=True, header_style="bold #8B0000")
             t.add_column("Metric", style="dim")
             t.add_column("Value", justify="right")
             t.add_row("Wall clock",        f"{result.wall_clock_s:.1f}s")
@@ -1268,10 +1384,6 @@ class AttackOrchestrator:
             t.add_row("Mean duration",     f"{result.mean_total_duration_s:.1f}s")
             console.print(t)
 
-            if result.state_timeline:
-                _print("\n[bold]Infra state timeline:[/bold]")
-                for offset, state in result.state_timeline:
-                    _print(f"  +{offset:6.1f}s  {state}")
         else:
             print(result.summary())
 
@@ -1296,7 +1408,7 @@ def main() -> None:
     _setup_logging()
 
     if _RICH:
-        console.print(_BANNER, style="bold cyan", highlight=False)
+        console.print(_BANNER, style="bold #8B0000", highlight=False)
         console.print(
             "       LLM Denial-of-Service Research Framework\n",
             style="dim",
@@ -1308,6 +1420,41 @@ def main() -> None:
 
     # Gather config interactively
     target  = gather_target_config()
+
+    # Optional load-balancer detection — run before setting system prompt so the
+    # user can see baseline routing behaviour first, then decide whether to pin
+    # a prefix.
+    run_lb = _choose(
+        "\nRun load-balancer detection test before attacking?",
+        ["y", "n"],
+        "n",
+    )
+    if run_lb == "y":
+        try:
+            asyncio.run(_run_lb_test(target))
+        except KeyboardInterrupt:
+            _print("\n  LB test interrupted." if not _RICH else "\n  [yellow]LB test interrupted.[/yellow]")
+
+        cont = _choose("Continue to attack configuration?", ["y", "n"], "y")
+        if cont != "y":
+            return
+
+    # System prompt — asked after the LB test so the user can observe baseline
+    # routing before deciding whether to pin a prefix.
+    _print(
+        "\n  [dim]System prompt — sent with every attack and probe request. "
+        "A shared prefix pins concurrent requests to the same KV-cache slot "
+        "via prefix-aware routing. Leave blank to omit.[/dim]"
+        if _RICH else
+        "\n  System prompt — sent with every attack and probe request. A shared prefix\n"
+        "  pins requests to the same KV-cache slot via prefix-aware routing.\n"
+        "  Leave blank to omit."
+    )
+    system_prompt_raw = _ask("System prompt (leave blank to omit)")
+    if system_prompt_raw:
+        import dataclasses
+        target = dataclasses.replace(target, system_prompt=system_prompt_raw)
+
     params  = gather_attack_params(target)
 
     orchestrator = AttackOrchestrator(
