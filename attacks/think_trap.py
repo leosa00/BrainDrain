@@ -670,6 +670,9 @@ class ThinkTrapAttack(BaseAttack):
             "tt_prompt_preview": prompt_text[:120],
         })
 
+        if self.config.target.request_template:
+            return self._template_payload(prompt_text)
+
         fmt = self.config.target.api_format
         if fmt == APIFormat.OPENAI:
             return self._openai_payload(prompt_text)
@@ -679,7 +682,9 @@ class ThinkTrapAttack(BaseAttack):
             return self._ollama_payload(prompt_text)
         elif fmt == APIFormat.TEST:
             return self._test_payload()
-        else:  # CUSTOM — fall back to OpenAI schema
+        elif fmt == APIFormat.VERTEX:
+            return self._vertex_payload(prompt_text)
+        else:
             return self._openai_payload(prompt_text)
 
     def _effective_system_prompt(self) -> Optional[str]:
@@ -693,6 +698,12 @@ class ThinkTrapAttack(BaseAttack):
             messages.append({"role": "system", "content": sp})
         messages.append({"role": "user", "content": prompt})
         return messages
+
+    def _template_payload(self, prompt: str) -> dict[str, Any]:
+        import copy
+        payload = copy.deepcopy(self.config.target.request_template)
+        payload_str = json.dumps(payload).replace('"__PROMPT__"', json.dumps(prompt))
+        return json.loads(payload_str)
 
     def _openai_payload(self, prompt: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -729,6 +740,19 @@ class ThinkTrapAttack(BaseAttack):
             },
         }
 
+    def _vertex_payload(self, prompt: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": self.config.max_tokens,
+                "temperature":     self.config.temperature,
+            },
+        }
+        sp = self._effective_system_prompt()
+        if sp:
+            payload["systemInstruction"] = {"parts": [{"text": sp}]}
+        return payload
+
     def _test_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model":       self.config.target.model,
@@ -758,6 +782,8 @@ class ThinkTrapAttack(BaseAttack):
             return self._parse_anthropic_chunk(data, result)
         elif fmt == APIFormat.OLLAMA:
             return self._parse_ollama_chunk(data, result)
+        elif fmt == APIFormat.VERTEX:
+            return self._parse_vertex_chunk(data, result)
         else:
             return self._parse_openai_chunk(data, result)
 
@@ -817,6 +843,39 @@ class ThinkTrapAttack(BaseAttack):
             return None
         return data.get("message", {}).get("content")
 
+    def _parse_vertex_chunk(
+        self, data: dict, result: AttackResult
+    ) -> Optional[str]:
+        usage = data.get("usageMetadata", {})
+        if usage:
+            result.token_metrics.prompt_tokens = (
+                usage.get("promptTokenCount", 0) or result.token_metrics.prompt_tokens
+            )
+            result.token_metrics.completion_tokens = (
+                usage.get("candidatesTokenCount", 0) or result.token_metrics.completion_tokens
+            )
+            result.token_metrics.reasoning_tokens = (
+                usage.get("thoughtsTokenCount", 0) or result.token_metrics.reasoning_tokens
+            )
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return None
+        parts = candidates[0].get("content", {}).get("parts", [])
+        for part in parts:
+            text = part.get("text", "")
+            if not text:
+                continue
+            if part.get("thought"):
+                result.metadata["_streaming_reasoning_tokens"] = (
+                    result.metadata.get("_streaming_reasoning_tokens", 0) + 1
+                )
+                return None
+            if self.tt_config.verbose_stream:
+                print(text, end="", flush=True)
+            return text
+        return None
+
     # ── Non-streaming parser ──────────────────
 
     def parse_full_response(
@@ -847,6 +906,18 @@ class ThinkTrapAttack(BaseAttack):
             result.token_metrics.prompt_tokens     = data.get("prompt_eval_count", 0)
             result.token_metrics.completion_tokens = data.get("eval_count", 0)
             result.raw_response = data.get("message", {}).get("content", "")
+
+        elif fmt == APIFormat.VERTEX:
+            usage = data.get("usageMetadata", {})
+            result.token_metrics.prompt_tokens     = usage.get("promptTokenCount", 0)
+            result.token_metrics.completion_tokens = usage.get("candidatesTokenCount", 0)
+            result.token_metrics.reasoning_tokens  = usage.get("thoughtsTokenCount", 0)
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                result.raw_response = "".join(
+                    p.get("text", "") for p in parts if not p.get("thought")
+                )
 
     # ── Accessors ─────────────────────────────
 

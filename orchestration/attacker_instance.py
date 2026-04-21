@@ -65,6 +65,7 @@ class AttackerInstance:
         self._timeouts: int = 0
         self._current_attack: Optional[BaseAttack] = None
         self._dynamic_delay_s: float = 0.0
+        self._cancelled_result: Optional[AttackResult] = None
 
     # ── Core execution ────────────────────────────────────────────────────
 
@@ -104,6 +105,17 @@ class AttackerInstance:
             try:
                 result = await attack.run()
             except asyncio.CancelledError:
+                partial = attack._current_result
+                if partial is not None:
+                    partial.status = AttackStatus.CANCELLED
+                    if partial.token_metrics.prompt_tokens == 0:
+                        from attacks.reasoning_bomb import ReasoningBombAttack
+                        if isinstance(attack, ReasoningBombAttack):
+                            try:
+                                partial.token_metrics.prompt_tokens = int(attack.rb_config.budget_tier)
+                            except (ValueError, AttributeError):
+                                pass
+                    self._cancelled_result = partial
                 await attack.close()
                 self._current_attack = None
                 raise
@@ -173,6 +185,9 @@ class AttackerInstance:
                     await asyncio.sleep(self._dynamic_delay_s)
 
             except asyncio.CancelledError:
+                if self._cancelled_result is not None:
+                    await result_queue.put(self._cancelled_result)
+                    self._cancelled_result = None
                 raise
             except Exception as exc:
                 # Should not happen — run_once catches internally, but
@@ -188,9 +203,6 @@ class AttackerInstance:
         Called by orchestrator during THRASHING backoff.
         Not thread-safe — only call from the same event loop.
         """
-        # Stored for use by run_loop on the next iteration.
-        # run_loop reads this via the closure-passed kwarg on each cycle,
-        # so we expose it as an attribute the orchestrator can overwrite.
         self._dynamic_delay_s = delay_s
 
     # ── Observability ─────────────────────────────────────────────────────

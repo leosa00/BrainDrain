@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -24,6 +25,7 @@ from orchestration.attacker_instance import AttackerInstance, AttackerInstanceCo
 from orchestration.registry import make_config_factory
 from orchestration.result_collector import ResultCollector
 from probes.itl_probes import InfraState, ITLProbes, ProbeConfig
+from probes.kv_saturation_calculator import requests_to_fill_kv
 
 try:
     from rich.console import Console
@@ -240,32 +242,66 @@ async def try_fetch_context_length(target: TargetConfig) -> Optional[int]:
 def gather_target_config() -> TargetConfig:
     _print("\n[bold #8B0000]── Target Configuration ──[/bold #8B0000]" if _RICH else "\n── Target Configuration ──")
 
-    base_url = _ask("Target URL / IP (e.g. http://1.2.3.4 or https://api.example.com)")
-    if not base_url.startswith("http"):
-        base_url = "http://" + base_url
-
-    model = _ask("Model name (e.g. deepseek-r1-7b, gpt-4o)")
-
     fmt_str = _choose(
         "API format",
-        ["openai", "anthropic", "ollama", "custom"],
+        ["openai", "anthropic", "ollama", "vertex", "custom"],
         "openai",
     )
+
+    if fmt_str == "custom":
+        return _gather_custom_target()
+
     fmt_map = {
         "openai":    APIFormat.OPENAI,
         "anthropic": APIFormat.ANTHROPIC,
         "ollama":    APIFormat.OLLAMA,
-        "custom":    APIFormat.CUSTOM,
+        "vertex":    APIFormat.VERTEX,
     }
     api_format = fmt_map[fmt_str]
 
-    api_key_raw = _ask("API key (leave blank if not required)")
+    if api_format == APIFormat.VERTEX:
+        _print(
+            "  [dim]Vertex AI (Google models): enter the full model path, e.g.\n"
+            "  https://LOCATION-aiplatform.googleapis.com/v1/projects/PROJECT_ID/"
+            "locations/LOCATION/publishers/google/models/MODEL\n"
+            "  Example: https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/"
+            "locations/us-central1/publishers/google/models/gemini-2.5-pro\n"
+            "  The model name is extracted from the URL automatically.\n"
+            "  Use an OAuth2 access token (gcloud auth print-access-token) as the API key.[/dim]"
+            if _RICH else
+            "  Vertex AI (Google models): enter the full model path, e.g.\n"
+            "  https://LOCATION-aiplatform.googleapis.com/v1/projects/PROJECT_ID/"
+            "locations/LOCATION/publishers/google/models/MODEL\n"
+            "  Example: https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/"
+            "locations/us-central1/publishers/google/models/gemini-2.5-pro\n"
+            "  The model name is extracted from the URL automatically.\n"
+            "  Use an OAuth2 access token (gcloud auth print-access-token) as the API key."
+        )
+        base_url = _ask("Vertex model URL")
+        if not base_url.startswith("http"):
+            base_url = "https://" + base_url
+        for _action in (":streamGenerateContent", ":generateContent", ":predict"):
+            if _action in base_url:
+                base_url = base_url.split(_action)[0]
+                break
+        base_url = base_url.rstrip("/")
+        model = base_url.split("/")[-1]
+    else:
+        base_url = _ask("Target URL / IP (e.g. http://1.2.3.4 or https://api.example.com)")
+        if not base_url.startswith("http"):
+            base_url = "http://" + base_url
+        model = _ask("Model name (e.g. deepseek-r1-7b, gpt-4o)")
+
+    api_key_raw = _ask(
+        "OAuth2 access token" if api_format == APIFormat.VERTEX else "API key (leave blank if not required)"
+    )
     api_key = api_key_raw if api_key_raw else None
 
-    timeout_s = float(_ask("Request timeout (seconds)", "300"))
+    _timeout_raw = _ask("Request timeout (seconds, leave blank for no timeout)", "N/A")
+    timeout_s: Optional[float] = None if _timeout_raw.upper() in ("N/A", "", "NONE") else float(_timeout_raw)
 
     supports_stream_options = True
-    if api_format in (APIFormat.OLLAMA, APIFormat.CUSTOM):
+    if api_format == APIFormat.OLLAMA:
         raw = _ask("Server supports stream_options (OpenAI >=1.x)? (y/n)", "y")
         supports_stream_options = raw.lower().startswith("y")
 
@@ -276,6 +312,105 @@ def gather_target_config() -> TargetConfig:
         api_key=api_key,
         timeout=timeout_s,
         supports_stream_options=supports_stream_options,
+    )
+
+
+def _gather_custom_target() -> TargetConfig:
+    """
+    Custom endpoint: user pastes a single JSON object describing the full request.
+
+    Expected format:
+        {
+          "url": "https://...",
+          "headers": { "Authorization": "Bearer ...", "anthropic-beta": "..." },
+          "body": {
+            "anthropic_version": "vertex-2023-10-16",
+            "max_tokens": 16000,
+            "messages": [{"role": "user", "content": "__PROMPT__"}]
+          }
+        }
+
+    The tool replaces "__PROMPT__" with the attack prompt at runtime and injects
+    "stream": true into the body. Everything else is sent exactly as provided.
+    """
+    _print(
+        "  [dim]Custom mode: paste a complete request descriptor as JSON.\n"
+        "  Format:\n"
+        '    {\n'
+        '      "url": "https://...",\n'
+        '      "headers": { "Authorization": "Bearer ...", ... },\n'
+        '      "body": { ..., "content": "__PROMPT__" }\n'
+        '    }\n'
+        '  Replace the message content field with [bold]"__PROMPT__"[/bold] — the tool injects the\n'
+        '  attack prompt there. Everything else is sent exactly as you write it.\n'
+        "  Paste the JSON, then press Enter on a blank line to finish.[/dim]"
+        if _RICH else
+        "  Custom mode: paste a complete request descriptor as JSON.\n"
+        "  Format:\n"
+        '    {\n'
+        '      "url": "https://...",\n'
+        '      "headers": { "Authorization": "Bearer ...", ... },\n'
+        '      "body": { ..., "content": "__PROMPT__" }\n'
+        '    }\n'
+        '  Replace the message content field with "__PROMPT__" — the tool injects the\n'
+        "  attack prompt there. Everything else is sent exactly as you write it.\n"
+        "  Paste the JSON, then press Enter on a blank line to finish."
+    )
+
+    _print("  Paste request JSON (blank line to finish):" if not _RICH
+           else "  Paste request JSON (blank line to finish):")
+    lines = []
+    while True:
+        line = input("")
+        if line == "" and lines:
+            break
+        lines.append(line)
+
+    raw_json = "\n".join(lines).strip()
+    try:
+        descriptor = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        _print(
+            f"  [bold red]Invalid JSON: {exc}[/bold red]" if _RICH
+            else f"  Invalid JSON: {exc}"
+        )
+        descriptor = {}
+
+    schema = _choose(
+        "Response stream format (for parsing only)",
+        ["openai", "anthropic", "vertex", "ollama"],
+        "openai",
+    )
+    schema_map = {
+        "openai":    APIFormat.OPENAI,
+        "anthropic": APIFormat.ANTHROPIC,
+        "vertex":    APIFormat.VERTEX,
+        "ollama":    APIFormat.OLLAMA,
+    }
+    api_format = schema_map[schema]
+
+    model = _ask("Model name (for display/logging only)", "custom")
+    _timeout_raw = _ask("Request timeout (seconds, leave blank for no timeout)", "N/A")
+    timeout_s: Optional[float] = None if _timeout_raw.upper() in ("N/A", "", "NONE") else float(_timeout_raw)
+
+    endpoint_url  = descriptor.get("url", "")
+    extra_headers = {k: v for k, v in descriptor.get("headers", {}).items()
+                     if k.lower() != "content-type"}  # content-type is set by the session
+    body_template = descriptor.get("body")
+
+    if not endpoint_url:
+        _print("  [yellow]Warning: no 'url' found in descriptor.[/yellow]" if _RICH
+               else "  Warning: no 'url' found in descriptor.")
+
+    return TargetConfig(
+        base_url=endpoint_url,
+        model=model,
+        api_format=api_format,
+        api_key=None,               # auth is carried in extra_headers
+        endpoint_path="",           # use url exactly as-is
+        timeout=timeout_s,
+        extra_headers=extra_headers,
+        request_template=body_template,
     )
 
 
@@ -456,6 +591,74 @@ async def _fetch_context_length_safe(target: TargetConfig) -> Optional[int]:
 
 
 # ─────────────────────────────────────────────
+# KV saturation calculator
+# ─────────────────────────────────────────────
+
+def _run_kv_calculator() -> None:
+    """Interactive wizard for the KV saturation calculator."""
+    _print(
+        "\n[bold #8B0000]── KV Cache Saturation Calculator ──[/bold #8B0000]"
+        if _RICH else
+        "\n── KV Cache Saturation Calculator ──"
+    )
+    _print(
+        "  Estimates how many concurrent requests are needed to fill\n"
+        "  the KV cache on a single GPU, forcing memory pressure.\n"
+        if _RICH else
+        "  Estimates how many concurrent requests are needed to fill\n"
+        "  the KV cache on a single GPU, forcing memory pressure.\n"
+    )
+
+    _print("[bold]GPU / server config[/bold]" if _RICH else "GPU / server config")
+    gpu_vram_gb          = _ask_float("GPU VRAM (GB)", default=96.0, min_val=1.0)
+    model_weights_gb     = _ask_float("Model weights on-device (GB, after quantization)", default=14.0, min_val=0.1)
+    gpu_mem_util         = _ask_float("GPU memory utilization fraction (e.g. 0.85)", default=0.85, min_val=0.01)
+    activation_overhead_gb = _ask_float("Activation overhead (GB, vLLM default ~2)", default=2.0, min_val=0.0)
+
+    _print("\n[bold]Model architecture[/bold]" if _RICH else "\nModel architecture")
+    num_layers   = _ask_int("Number of layers", default=28)
+    num_kv_heads = _ask_int("Number of KV heads (GQA heads, not Q heads)", default=4)
+    head_dim     = _ask_int("Head dimension (hidden_size / num_q_heads)", default=128)
+    dtype_bytes  = _ask_int("KV cache dtype bytes (2=fp16/bf16, 1=fp8)", default=2)
+
+    _print("\n[bold]Request shape[/bold]" if _RICH else "\nRequest shape")
+    prompt_tokens = _ask_int("Prompt tokens per request", default=256)
+    max_tokens    = _ask_int("Max tokens per request", default=15000)
+
+    _print("")
+    try:
+        n = requests_to_fill_kv(
+            gpu_vram_gb=gpu_vram_gb,
+            model_weights_gb=model_weights_gb,
+            gpu_mem_util=gpu_mem_util,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            dtype_bytes=dtype_bytes,
+            activation_overhead_gb=activation_overhead_gb,
+            verbose=True,
+        )
+        _print(
+            f"\n  [bold green]Requests to fill KV cache: {n}[/bold green]"
+            if _RICH else
+            f"\n  Requests to fill KV cache: {n}"
+        )
+        _print(
+            f"  [dim]Set number of concurrent attacker instances to at least [bold]{n}[/bold] "
+            f"to saturate the KV cache.[/dim]"
+            if _RICH else
+            f"  Set number of concurrent attacker instances to at least {n} "
+            f"to saturate the KV cache."
+        )
+    except ValueError as exc:
+        _print(
+            f"  [bold red]Error: {exc}[/bold red]" if _RICH else f"  Error: {exc}"
+        )
+
+
+# ─────────────────────────────────────────────
 # Load balancer test
 # ─────────────────────────────────────────────
 
@@ -508,6 +711,16 @@ async def _run_lb_test(target: TargetConfig) -> None:
             f"  LB test failed: {result.get('error')}"
         )
         return
+
+    errors = result.get("errors", [])
+    if errors:
+        _print(
+            f"  [yellow]Warning: {len(errors)} probe pair(s) failed and were skipped:[/yellow]"
+            if _RICH else
+            f"  Warning: {len(errors)} probe pair(s) failed and were skipped:"
+        )
+        for e in errors:
+            _print(f"    [dim]{e}[/dim]" if _RICH else f"    {e}")
 
     hit_rate   = result["cache_hit_rate"]
     same       = result["same_backend"]
@@ -568,6 +781,7 @@ async def _run_lb_test(target: TargetConfig) -> None:
 # ─────────────────────────────────────────────
 # Build attack factory
 # ─────────────────────────────────────────────
+
 
 def build_attack_factory(
     attack_type: str,
@@ -994,13 +1208,9 @@ class AttackOrchestrator:
             )
             self._collector.record_state(state)
 
-        def on_state_change(__old: InfraState, __new: InfraState) -> None:
-            pass
-
         await self._probes.monitor(
             interval_s=self.PROBE_INTERVAL_S,
             on_probe=on_probe,
-            on_state_change=on_state_change,
             stop_event=self._stop,
         )
 
@@ -1373,6 +1583,7 @@ class AttackOrchestrator:
             t.add_row("Total requests",    str(result.total_requests))
             t.add_row("Successful",        str(result.successful))
             t.add_row("Timed out",         str(result.timed_out))
+            t.add_row("Cancelled",         str(result.cancelled))
             t.add_row("Failed",            str(result.failed))
             t.add_row("Mean amp ratio",    f"{result.mean_amplification_ratio:.1f}×")
             t.add_row("P95 amp ratio",     f"{result.p95_amplification_ratio:.1f}×")
@@ -1420,6 +1631,15 @@ def main() -> None:
 
     # Gather config interactively
     target  = gather_target_config()
+
+    # Optional KV saturation calculator
+    run_kv = _choose(
+        "\nRun KV cache saturation calculator? Note requires specific GPU and model parameters",
+        ["y", "n"],
+        "n",
+    )
+    if run_kv == "y":
+        _run_kv_calculator()
 
     # Optional load-balancer detection — run before setting system prompt so the
     # user can see baseline routing behaviour first, then decide whether to pin

@@ -107,7 +107,6 @@ class ProbeResult:
             return
         ms = [v * 1000.0 for v in self.itl_values]
         n  = len(ms)
-        self.chunk_count = n
         if n > 1 and len(self.raw_text.split()) > n:
             self.tokens_out = len(self.raw_text.split())
         else:
@@ -542,6 +541,22 @@ class ITLProbes:
     def _build_payload(self, prompt: str, max_tokens: int, stream: bool = True) -> dict:
         fmt = self.config.target.api_format
         sp  = self.config.target.system_prompt
+
+        # Vertex AI uses a completely different schema
+        if fmt == APIFormat.VERTEX:
+            payload: dict[str, Any] = {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "maxOutputTokens": max_tokens,
+                    "temperature":     self.config.temperature,
+                },
+            }
+            if sp:
+                payload["systemInstruction"] = {"parts": [{"text": sp}]}
+            if self.config.probe_extra_body:
+                payload.update(self.config.probe_extra_body)
+            return payload
+
         msgs = []
         if sp and fmt != APIFormat.ANTHROPIC:
             msgs.append({"role": "system", "content": sp})
@@ -607,6 +622,16 @@ class ITLProbes:
         elif fmt == APIFormat.OLLAMA:
             return None if data.get("done") else data.get("message", {}).get("content")
 
+        elif fmt == APIFormat.VERTEX:
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return None
+            parts = candidates[0].get("content", {}).get("parts", [])
+            for part in parts:
+                if "text" in part:
+                    return part["text"]
+            return None
+
         return None
 
     # ── Raw stream consumer ───────────────────────────────────────────────────
@@ -632,7 +657,7 @@ class ITLProbes:
             ) as resp:
                 if resp.status >= 400:
                     result.success = False
-                    result.error   = f"HTTP {resp.status}: {(await resp.text())[:200]}"
+                    result.error   = f"HTTP {resp.status}: {(await resp.text())[:800]}"
                     return
 
                 buf  = b""
@@ -693,7 +718,7 @@ class ITLProbes:
 
         async def _do() -> None:
             async with session.post(
-                self.config.target.endpoint,
+                self.config.target.nonstreaming_endpoint,
                 json=payload,
                 headers=self.config.target.auth_headers,
             ) as resp:
@@ -1256,15 +1281,24 @@ class ITLProbes:
 
         # ── Warm-up phase ──────────────────────────────────────────────────────
         # Use different UUIDs so warm-up requests don't pre-warm the test cache.
+        # Fast-fail on the first warm-up so auth/URL errors surface immediately
+        # rather than after waiting through all n_pairs × probe_timeout_s.
         logger.info("load_balancer_probe: running %d warm-up requests...", n_warmup)
-        for _ in range(n_warmup):
+        for wi in range(n_warmup):
             warmup_prompt = (
                 f"[warmup:{uuid.uuid4().hex}]\n\n{context_body}\n\n"
                 "Question: In one word, what is this text about?"
             )
-            await self._stream_probe(warmup_prompt, max_tokens=5, probe_type="lb_warmup")
+            r_wu = await self._stream_probe(warmup_prompt, max_tokens=5, probe_type="lb_warmup")
+            if not r_wu.success and wi == 0:
+                return {
+                    "success": False,
+                    "error":   f"warm-up probe failed: {r_wu.error}",
+                    "errors":  [f"warmup probe 0: {r_wu.error}"],
+                }
 
-        pairs = []
+        pairs:  list = []
+        errors: list = []
 
         for i in range(n_pairs):
             # UUID prefix makes the full prompt unique per pair. vLLM's block
@@ -1279,7 +1313,11 @@ class ITLProbes:
             r_cold = await self._stream_probe(prompt, max_tokens=5, probe_type="lb_cold")
             r_warm = await self._stream_probe(prompt, max_tokens=5, probe_type="lb_warm")
 
-            if r_cold.success and r_warm.success and r_cold.ttft_s > 0:
+            if not r_cold.success:
+                errors.append(f"cold probe {i}: {r_cold.error}")
+            elif not r_warm.success:
+                errors.append(f"warm probe {i}: {r_warm.error}")
+            elif r_cold.ttft_s > 0 and r_warm.ttft_s > 0:
                 ratio = r_warm.ttft_s / r_cold.ttft_s
                 pairs.append({
                     "pair":       i,
@@ -1288,12 +1326,20 @@ class ITLProbes:
                     "ratio":      round(ratio, 3),
                     "cache_hit":  ratio < cache_hit_threshold,
                 })
+            else:
+                zero_side = "cold" if r_cold.ttft_s == 0 else "warm"
+                errors.append(f"pair {i}: {zero_side} probe returned no tokens (ttft_s=0)")
 
             if i < n_pairs - 1:
                 await asyncio.sleep(inter_pair_delay_s)
 
         if not pairs:
-            return {"success": False, "error": "no successful probe pairs"}
+            last_err = errors[-1] if errors else "unknown"
+            return {
+                "success": False,
+                "error":   f"no successful probe pairs — last error: {last_err}",
+                "errors":  errors,
+            }
 
         n_hits   = sum(1 for p in pairs if p["cache_hit"])
         hit_rate = n_hits / len(pairs)
@@ -1324,6 +1370,7 @@ class ITLProbes:
 
         return {
             "success":           True,
+            "errors":            errors,
             "n_pairs":           len(pairs),
             "n_cache_hits":      n_hits,
             "cache_hit_rate":    round(hit_rate, 3),

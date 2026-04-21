@@ -15,7 +15,6 @@ from attacks.think_trap import ThinkTrapAttack, ThinkTrapConfig
 ATTACK_REGISTRY: dict[str, Type[BaseAttack]] = {
     "reasoning_bomb": ReasoningBombAttack,
     "think_trap":     ThinkTrapAttack,
-    # "fill_squeeze":   FillSqueezeAttack,    # TODO
 }
 
 

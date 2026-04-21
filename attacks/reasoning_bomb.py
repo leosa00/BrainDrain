@@ -250,8 +250,10 @@ class ReasoningBombAttack(BaseAttack):
             "puzzle_preview": puzzle[:120],
         }
 
-        fmt = self.config.target.api_format
+        if self.config.target.request_template:
+            return self._template_payload(puzzle)
 
+        fmt = self.config.target.api_format
         if fmt == APIFormat.OPENAI:
             return self._openai_payload(puzzle)
         elif fmt == APIFormat.ANTHROPIC:
@@ -260,8 +262,9 @@ class ReasoningBombAttack(BaseAttack):
             return self._ollama_payload(puzzle)
         elif fmt == APIFormat.TEST:
             return self._test_payload()
+        elif fmt == APIFormat.VERTEX:
+            return self._vertex_payload(puzzle)
         else:
-            # CUSTOM: fall back to OpenAI schema
             return self._openai_payload(puzzle)
 
     def _effective_system_prompt(self) -> Optional[str]:
@@ -275,6 +278,15 @@ class ReasoningBombAttack(BaseAttack):
             messages.append({"role": "system", "content": sp})
         messages.append({"role": "user", "content": puzzle})
         return messages
+
+    def _template_payload(self, puzzle: str) -> dict[str, Any]:
+        """Use request_template as the base body, injecting the puzzle prompt."""
+        import copy
+        payload = copy.deepcopy(self.config.target.request_template)
+        # Replace the __PROMPT__ placeholder with the actual puzzle text
+        payload_str = json.dumps(payload).replace('"__PROMPT__"', json.dumps(puzzle))
+        payload = json.loads(payload_str)
+        return payload
 
     def _openai_payload(self, puzzle: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -311,6 +323,19 @@ class ReasoningBombAttack(BaseAttack):
             },
         }
 
+    def _vertex_payload(self, puzzle: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": puzzle}]}],
+            "generationConfig": {
+                "maxOutputTokens": self.config.max_tokens,
+                "temperature":     self.config.temperature,
+            },
+        }
+        sp = self._effective_system_prompt()
+        if sp:
+            payload["systemInstruction"] = {"parts": [{"text": sp}]}
+        return payload
+
     def _test_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model":       self.config.target.model,
@@ -320,7 +345,6 @@ class ReasoningBombAttack(BaseAttack):
             "stream":      self.config.stream,
         }
         if self.config.stream:
-            # Request token-level usage in the final stream chunk (OpenAI >=1.x)
             payload["stream_options"] = {"include_usage": True}
         return payload
     
@@ -348,10 +372,10 @@ class ReasoningBombAttack(BaseAttack):
             return self._parse_anthropic_chunk(data, result)
         elif fmt == APIFormat.OLLAMA:
             return self._parse_ollama_chunk(data, result)
-        elif fmt == APIFormat.TEST:
+        elif fmt == APIFormat.VERTEX:
+            return self._parse_vertex_chunk(data, result)
+        elif fmt in (APIFormat.TEST, APIFormat.CUSTOM):
             return self._parse_custom_chunk(data, result)
-        elif fmt == APIFormat.CUSTOM: 
-            return self._parse_custom_chunk(data,result)
         return None
 
     def _parse_custom_chunk(self, data: dict, result: AttackResult) -> Optional[str]:
@@ -462,6 +486,45 @@ class ReasoningBombAttack(BaseAttack):
             return None
         return data.get("message", {}).get("content")
 
+    def _parse_vertex_chunk(
+        self, data: dict, result: AttackResult
+    ) -> Optional[str]:
+        # usageMetadata appears in the final chunk
+        usage = data.get("usageMetadata", {})
+        if usage:
+            result.token_metrics.prompt_tokens = (
+                usage.get("promptTokenCount", 0) or result.token_metrics.prompt_tokens
+            )
+            result.token_metrics.completion_tokens = (
+                usage.get("candidatesTokenCount", 0) or result.token_metrics.completion_tokens
+            )
+            result.token_metrics.reasoning_tokens = (
+                usage.get("thoughtsTokenCount", 0) or result.token_metrics.reasoning_tokens
+            )
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return None
+        parts = candidates[0].get("content", {}).get("parts", [])
+        for part in parts:
+            text = part.get("text", "")
+            if not text:
+                continue
+            if part.get("thought"):
+                # Thinking token — track count but don't emit as content
+                if result.latency_metrics.ttfrt_s == 0.0:
+                    t_now   = result.metadata.get("_t_now", 0.0)
+                    t_start = result.metadata.get("_t_start", 0.0)
+                    result.latency_metrics.ttfrt_s = t_now - t_start
+                result.metadata["_streaming_reasoning_tokens"] = (
+                    result.metadata.get("_streaming_reasoning_tokens", 0) + 1
+                )
+                return None
+            if self.rb_config.verbose_stream:
+                print(text, end="", flush=True)
+            return text
+        return None
+
     # ── Non-streaming Parser ──────────────────
 
     def parse_full_response(
@@ -497,11 +560,21 @@ class ReasoningBombAttack(BaseAttack):
         elif fmt == APIFormat.OLLAMA:
             result.token_metrics.prompt_tokens     = data.get("prompt_eval_count", 0)
             result.token_metrics.completion_tokens = data.get("eval_count", 0)
-            result.raw_response = (
-                data.get("message", {}).get("content", "")
-            )
+            result.raw_response = data.get("message", {}).get("content", "")
 
-        
+        elif fmt == APIFormat.VERTEX:
+            usage = data.get("usageMetadata", {})
+            result.token_metrics.prompt_tokens     = usage.get("promptTokenCount", 0)
+            result.token_metrics.completion_tokens = usage.get("candidatesTokenCount", 0)
+            result.token_metrics.reasoning_tokens  = usage.get("thoughtsTokenCount", 0)
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                result.raw_response = "".join(
+                    p.get("text", "") for p in parts if not p.get("thought")
+                )
+
+
     # ── Accessors ────────────────────────────
 
     @property

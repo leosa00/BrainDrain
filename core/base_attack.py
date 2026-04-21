@@ -26,6 +26,7 @@ class AttackStatus(Enum):
     SUCCESS   = "success"
     FAILED    = "failed"
     TIMEOUT   = "timeout"
+    CANCELLED = "cancelled"
 
 
 class APIFormat(Enum):
@@ -33,7 +34,8 @@ class APIFormat(Enum):
     ANTHROPIC = "anthropic"   # /v1/messages
     OLLAMA    = "ollama"      # /api/chat
     CUSTOM    = "custom"
-    TEST = "test"     # user-defined endpoint
+    TEST      = "test"        # user-defined endpoint
+    VERTEX    = "vertex"      # Vertex AI — base_url must include the full model path
 
 
 # ─────────────────────────────────────────────
@@ -46,30 +48,44 @@ class TargetConfig:
     model:                str
     api_format:           APIFormat = APIFormat.OPENAI
     api_key:              Optional[str] = None
+    # endpoint_path controls the URL used for requests:
+    #   None  → use the format default (e.g. /v1/chat/completions)
+    #   ""    → use base_url exactly as-is
+    #   other → append to base_url
     endpoint_path:        Optional[str] = None
-    timeout:              float = 120.0
+    timeout:              Optional[float] = None
     verify_ssl:           bool  = True
     extra_headers:        dict[str, str] = field(default_factory=dict)
-    # NEW: set False for any endpoint that rejects OpenAI stream_options
-    # (Ollama /v1 shim, LM Studio older builds, some Azure deployments)
     supports_stream_options: bool = True
-    # Optional system prompt sent with every request to this target.
-    # Useful for prefix-aware routing: a shared prefix pins all concurrent
-    # requests to the same KV-cache / GPU worker.
-    system_prompt: Optional[str] = None
+    system_prompt:        Optional[str] = None
+    # If set, used as the base request body instead of the built-in payload
+    # builders. The string "__PROMPT__" anywhere in the template is replaced
+    # with the attack prompt at runtime.
+    request_template:     Optional[dict] = None
 
     @property
     def endpoint(self) -> str:
-        if self.endpoint_path:
-            return f"{self.base_url.rstrip('/')}/{self.endpoint_path.lstrip('/')}"
+        if self.endpoint_path is not None:
+            if self.endpoint_path:
+                return f"{self.base_url.rstrip('/')}/{self.endpoint_path.lstrip('/')}"
+            return self.base_url  # empty string → use base_url exactly
+        if self.api_format == APIFormat.VERTEX:
+            return f"{self.base_url.rstrip('/')}:streamGenerateContent?alt=sse"
         defaults = {
             APIFormat.OPENAI:    "/v1/chat/completions",
             APIFormat.ANTHROPIC: "/v1/messages",
             APIFormat.OLLAMA:    "/api/chat",
             APIFormat.CUSTOM:    CUSTOM_PATH,
-            APIFormat.TEST: "/v1/chat/completions",
+            APIFormat.TEST:      "/v1/chat/completions",
         }
         return f"{self.base_url.rstrip('/')}{defaults[self.api_format]}"
+
+    @property
+    def nonstreaming_endpoint(self) -> str:
+        """Endpoint for non-streaming requests (used by ttft_probe)."""
+        if self.api_format == APIFormat.VERTEX:
+            return f"{self.base_url.rstrip('/')}:generateContent"
+        return self.endpoint
 
     @property
     def auth_headers(self) -> dict[str, str]:
@@ -118,7 +134,7 @@ class TokenMetrics:
         """Completion / prompt ratio — key DoS efficiency metric."""
         if self.prompt_tokens == 0:
             return 0.0
-        return (self.completion_tokens + self.reasoning_tokens) / self.prompt_tokens # If no reasoning tokens, then it is 0
+        return (self.completion_tokens + self.reasoning_tokens) / self.prompt_tokens
 
 
 @dataclass
@@ -190,6 +206,7 @@ class BaseAttack(ABC):
     def __init__(self, config: AttackConfig) -> None:
         self.config = config
         self._session: Optional[aiohttp.ClientSession] = None
+        self._current_result: Optional[AttackResult] = None
 
     # ── Identity ─────────────────────────────
 
@@ -238,7 +255,7 @@ class BaseAttack(ABC):
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(ssl=self.config.target.verify_ssl)
-            timeout   = aiohttp.ClientTimeout(total=self.config.target.timeout)
+            timeout   = aiohttp.ClientTimeout(total=self.config.target.timeout)  # None = no timeout
             self._session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,
@@ -263,6 +280,7 @@ class BaseAttack(ABC):
             status=AttackStatus.RUNNING,
         )
         result.metadata = self.config.metadata
+        self._current_result = result
 
         payload = self.build_payload()
         session = await self._get_session()

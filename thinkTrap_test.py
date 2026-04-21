@@ -41,10 +41,6 @@ async def main():
     # Load surrogate embeddings once (slow — downloads weights on first run)
     T, tok = load_surrogate_embeddings("mistralai/Mistral-7B-v0.1", hf_token=secret.huggingface_token)
 
-    # Option B: from a pre-saved .npy file (fast, after first run)
-    # np.save("mistral_embeddings.npy", T)   # save once
-    # T, tok = load_surrogate_embeddings("", embeddings_path="mistral_embeddings.npy")
-
     cfg = ThinkTrapConfig(
         prompt_length=P_LENGTH,
         latent_dim=latent_dim,

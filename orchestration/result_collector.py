@@ -44,6 +44,7 @@ class DDoSRunResult:
     successful: int = 0
     failed: int = 0
     timed_out: int = 0
+    cancelled: int = 0
 
     # ── Token metrics ─────────────────────────
     mean_amplification_ratio: float = 0.0
@@ -212,7 +213,10 @@ class ResultCollector:
         r.timed_out = sum(
             1 for x in self._results if x.status == AttackStatus.TIMEOUT
         )
-        r.failed = r.total_requests - r.successful - r.timed_out
+        r.cancelled = sum(
+            1 for x in self._results if x.status == AttackStatus.CANCELLED
+        )
+        r.failed = r.total_requests - r.successful - r.timed_out - r.cancelled
 
         # Token metrics — all requests (including failed) may have partial data
         r.total_prompt_tokens = sum(

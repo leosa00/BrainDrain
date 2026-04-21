@@ -7,28 +7,6 @@ Run modes:
     python probe_test.py --suite monitor   # continuous monitor (10 iterations)
 """
 
-# Run all suites in order (baseline → single → ttft → burst → ... → summary)                                                                                                                           
-  #python probe_test.py                                                                                                                                                                                 
-                                                                                                                                                                                                         
-  # Run just one suite (baseline calibration runs automatically first)                                                                                                                                   
-  #python probe_test.py --suite single                                                                                                                                                                    
-  #python probe_test.py --suite ttft                                                                                                                                                                      
-  #python probe_test.py --suite burst                                                                                                                                                                     
-  #python probe_test.py --suite preemption
-  #python probe_test.py --suite scan                                                                                                                                                                      
-  #python probe_test.py --suite kv
-  #python probe_test.py --suite tpot                                                                                                                                                                      
-  #python probe_test.py --suite abort                                                                                                                                                                     
-  #python probe_test.py --suite monitor     # 10 iterations, 3s apart (~30s)
-  #python probe_test.py --suite classify
-  #python probe_test.py --suite lb          # load balancer detection via APC consistency VERY EXPENSIVE
-  #python probe_test.py --suite summary     # reads rolling history, no new requests                                                                                                                      
-                                                                                                                                                                                                         
-  # Run baseline only (no auto-prepend)                                                                                                                                                                  
-  # To force a fresh baseline (server changed, pod restarted etc.):                                                                                                                                        
-  #rm probes/baseline_cache.json                                                                                                                                                                          
-  #python probe_test.py --suite baseline
-
 from __future__ import annotations
 
 import argparse
