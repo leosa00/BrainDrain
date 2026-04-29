@@ -344,8 +344,8 @@ ALL_ORDER = [
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-BASELINE_CACHE  = "probes/results/baseline_cache.json"
-HISTORY_FILE    = "probes/results/probe_history.jsonl"
+BASELINE_CACHE  = "results/baseline_cache.json"
+HISTORY_FILE    = "results/probe_history.jsonl"
 
 
 async def main(suite_name: str) -> None:

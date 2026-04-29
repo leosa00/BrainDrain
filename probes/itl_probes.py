@@ -101,6 +101,7 @@ class ProbeResult:
 
     success:       bool          = True
     error:         Optional[str] = None
+    infra_state:   Optional[str] = None
 
     def compute_derived(self) -> None:
         if not self.itl_values:
@@ -119,9 +120,12 @@ class ProbeResult:
         self.p99_itl_ms = s[min(int(math.ceil(0.99 * n)) - 1, n - 1)]
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "probe_id":       self.probe_id,
             "timestamp":      self.timestamp,
+            "timestamp_iso":  datetime.datetime.fromtimestamp(
+                self.timestamp, tz=datetime.timezone.utc
+            ).isoformat(),
             "probe_type":     self.probe_type,
             "ttft_s":         round(self.ttft_s, 4),
             "total_s":        round(self.total_s, 4),
@@ -135,6 +139,9 @@ class ProbeResult:
             "success":        self.success,
             "error":          self.error,
         }
+        if self.infra_state is not None:
+            d["infra_state"] = self.infra_state
+        return d
 
 
 @dataclass
@@ -236,6 +243,11 @@ class ProbeConfig:
     # On startup the last `rolling_window` entries are loaded into _itl_history
     # so rolling_summary() and classify_state() work across sessions.
     history_path: Optional[str] = None
+
+    # Per-run log: a separate timestamped JSONL written only for the current run.
+    # First line is a metadata record (type="run_meta"); subsequent lines are probe
+    # records from monitor() with infra_state included. Never read on startup.
+    run_log_path: Optional[str] = None
 
 
 # ─────────────────────────────────────────────
@@ -472,14 +484,15 @@ class ITLProbes:
     # ── Probe history persistence ─────────────────────────────────────────────
 
     def _append_history(self, result: ProbeResult) -> None:
-        """Append one probe result to the JSONL history file."""
-        path = self.config.history_path
-        if not path:
-            return
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a") as f:
-            f.write(json.dumps(result.to_dict()) + "\n")
+        """Append one probe result to the rolling history file and run log."""
+        line = json.dumps(result.to_dict()) + "\n"
+        for path in (self.config.history_path, self.config.run_log_path):
+            if not path:
+                continue
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a") as f:
+                f.write(line)
 
     def _load_history(self, path: str) -> None:
         """Load last `rolling_window` entries from the JSONL history file."""
@@ -494,6 +507,8 @@ class ITLProbes:
                 if not line.strip():
                     continue
                 d = json.loads(line)
+                if d.get("type") == "run_meta":
+                    continue
                 r = ProbeResult(
                     probe_id    = d.get("probe_id", ""),
                     timestamp   = d.get("timestamp", 0.0),
@@ -509,6 +524,7 @@ class ITLProbes:
                     kv_usage_est = d.get("kv_usage_est", -1.0),
                     success     = d.get("success", True),
                     error       = d.get("error"),
+                    infra_state = d.get("infra_state"),
                 )
                 self._itl_history.append(r)
             if self._itl_history:
@@ -607,7 +623,7 @@ class ITLProbes:
                 return None
             delta = choices[0].get("delta", {})
             content   = delta.get("content")
-            reasoning = delta.get("reasoning_content")
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
             if content is not None:
                 return content
             if reasoning is not None:
@@ -853,7 +869,6 @@ class ITLProbes:
                 [v * 1000.0 for v in result.itl_values]
             )
             self._itl_history.append(result)
-            self._append_history(result)
         return result
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -1418,6 +1433,9 @@ class ITLProbes:
             t_cycle_start = time.perf_counter()
             result = await self.single_probe()
             state  = self.classify_state(probe=result)
+
+            result.infra_state = state.value
+            self._append_history(result)
 
             if on_probe is not None:
                 try:

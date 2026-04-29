@@ -703,7 +703,13 @@ class ThinkTrapAttack(BaseAttack):
         import copy
         payload = copy.deepcopy(self.config.target.request_template)
         payload_str = json.dumps(payload).replace('"__PROMPT__"', json.dumps(prompt))
-        return json.loads(payload_str)
+        payload = json.loads(payload_str)
+        payload["stream"] = True
+        payload["max_tokens"] = self.config.max_tokens
+        if self.config.max_tokens <= 64:
+            payload.pop("reasoning", None)
+            payload.pop("thinking", None)
+        return payload
 
     def _openai_payload(self, prompt: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -813,7 +819,7 @@ class ThinkTrapAttack(BaseAttack):
             if rt:
                 result.token_metrics.reasoning_tokens = rt
 
-        content = delta.get("content") or delta.get("reasoning_content")
+        content = delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning")
         if self.tt_config.verbose_stream and content:
             print(content, end="", flush=True)
         return content if content else None

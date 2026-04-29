@@ -283,9 +283,15 @@ class ReasoningBombAttack(BaseAttack):
         """Use request_template as the base body, injecting the puzzle prompt."""
         import copy
         payload = copy.deepcopy(self.config.target.request_template)
-        # Replace the __PROMPT__ placeholder with the actual puzzle text
         payload_str = json.dumps(payload).replace('"__PROMPT__"', json.dumps(puzzle))
         payload = json.loads(payload_str)
+        payload["stream"] = True
+        payload["max_tokens"] = self.config.max_tokens
+        # Strip extended-thinking params for preflight (max_tokens=64) so it
+        # returns quickly instead of running a full reasoning trace.
+        if self.config.max_tokens <= 64:
+            payload.pop("reasoning", None)
+            payload.pop("thinking", None)
         return payload
 
     def _openai_payload(self, puzzle: str) -> dict[str, Any]:
@@ -393,19 +399,19 @@ class ReasoningBombAttack(BaseAttack):
         t_now     = result.metadata.get("_t_now", 0.0)
         t_start   = result.metadata.get("_t_start", 0.0)
 
-        # DeepSeek-R1 exposes the thinking trace under "reasoning" key
-        reasoning = delta.get("reasoning")
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
         if reasoning:
-            # Record TTFRT on first reasoning chunk
             if result.latency_metrics.ttfrt_s == 0.0:
                 result.latency_metrics.ttfrt_s = t_now - t_start
+            result.metadata["_streaming_reasoning_tokens"] = (
+                result.metadata.get("_streaming_reasoning_tokens", 0) + 1
+            )
             if self.rb_config.verbose_stream:
                 print(reasoning, end="", flush=True)
-            return None
+            return reasoning
 
         content = delta.get("content")
         if content:
-        # Record TTFCT on first content chunk
             if result.latency_metrics.ttft_s == 0.0:
                 result.latency_metrics.ttft_s = t_now - t_start
             if self.rb_config.verbose_stream:
