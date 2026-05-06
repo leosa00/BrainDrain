@@ -276,7 +276,9 @@ class ReasoningBombAttack(BaseAttack):
         sp = self._effective_system_prompt()
         if sp:
             messages.append({"role": "system", "content": sp})
-        messages.append({"role": "user", "content": puzzle})
+        prefix = self.config.target.request_prefix
+        content = f"{prefix}{puzzle}" if prefix else puzzle
+        messages.append({"role": "user", "content": content})
         return messages
 
     def _template_payload(self, puzzle: str) -> dict[str, Any]:

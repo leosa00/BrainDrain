@@ -10,7 +10,6 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import datetime
 import json
 import logging
 import sys
@@ -480,7 +479,7 @@ def gather_attack_params(target: TargetConfig) -> dict:
 
     if attack_type == "reasoning_bomb":
         puzzle_file = _ask("Path to puzzle JSON file", "prompts/reasoningBomb_puzzles.json")
-        budget_tier = _choose("Puzzle budget tier", ["128", "256", "512"], "256")
+        budget_tier = _choose("Puzzle budget tier", ["128", "256", "512", "mixed"], "256")
         extra["puzzle_file"] = puzzle_file
         extra["budget_tier"] = budget_tier
 
@@ -490,7 +489,8 @@ def gather_attack_params(target: TargetConfig) -> dict:
 
     # ── Determine prompt token cost, then probe for context limit ────────────
     if attack_type == "reasoning_bomb":
-        estimated_prompt_tokens = int(extra.get("budget_tier", 0))
+        raw_tier = extra.get("budget_tier", "0")
+        estimated_prompt_tokens = max(int(t) for t in ["128", "256", "512"]) if raw_tier == "mixed" else int(raw_tier)
     else:
         estimated_prompt_tokens = _estimate_prompt_tokens(attack_type, extra)
 
@@ -572,6 +572,9 @@ def gather_attack_params(target: TargetConfig) -> dict:
     )
     stream_read_delay_s = _ask_float("Stream read delay per chunk (seconds, 0=off)", default=0.0, min_val=0.0)
 
+    skip_probing_raw = _choose("Enable ITL probing during attack?", ["y", "n"], "y")
+    skip_probing = skip_probing_raw != "y"
+
     return {
         "attack_type":          attack_type,
         "n_instances":          n_instances,
@@ -580,6 +583,7 @@ def gather_attack_params(target: TargetConfig) -> dict:
         "launch_stagger_s":     launch_stagger_s,
         "max_tokens_spread_pct": max_tokens_spread_pct,
         "stream_read_delay_s":  stream_read_delay_s,
+        "skip_probing":         skip_probing,
         "extra":                extra,
     }
 
@@ -807,10 +811,15 @@ def build_attack_factory(
     if attack_type == "reasoning_bomb":
         puzzle_file  = extra.get("puzzle_file", "prompts/reasoningBomb_puzzles.json")
         budget_tier  = extra.get("budget_tier", "256")
+        if budget_tier == "mixed":
+            tiers = ["128", "256", "512"]
+            effective_tier = tiers[instance_index % len(tiers)]
+        else:
+            effective_tier = budget_tier
         puzzle_index = instance_index % n_puzzles if n_puzzles else None
         rb_cfg = ReasoningBombConfig(
             puzzle_file=puzzle_file,
-            budget_tier=budget_tier,
+            budget_tier=effective_tier,
             puzzle_index=puzzle_index,
         )
         return ReasoningBombAttack, config_factory, {"rb_config": rb_cfg}
@@ -953,6 +962,7 @@ class AttackOrchestrator:
         launch_stagger_s:     float = 0.0,
         max_tokens_spread_pct: float = 0.0,
         stream_read_delay_s:  float = 0.0,
+        skip_probing:         bool  = False,
     ) -> None:
         self.target               = target
         self.attack_type          = attack_type
@@ -963,6 +973,7 @@ class AttackOrchestrator:
         self.launch_stagger_s     = launch_stagger_s
         self.max_tokens_spread_pct = max_tokens_spread_pct
         self.stream_read_delay_s  = stream_read_delay_s
+        self.skip_probing         = skip_probing
 
         self._stop   = asyncio.Event()
         self._queue:  asyncio.Queue = asyncio.Queue()
@@ -982,11 +993,6 @@ class AttackOrchestrator:
         self._recovery_category: str  = ""
         self._consecutive_failures    = 0
 
-        # Per-run output files — probe log (JSONL) + attack summary (JSON)
-        _ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        self._run_log_path    = f"results/run_{_ts}_probes.jsonl"
-        self._attack_log_path = f"results/run_{_ts}_attack.json"
-
         # Live display handle (set during run())
         self._live:         Optional[Any]            = None
         self._refresh_task: Optional[asyncio.Task]  = None
@@ -998,7 +1004,10 @@ class AttackOrchestrator:
                 pf  = attack_extra.get("puzzle_file", "prompts/reasoningBomb_puzzles.json")
                 bt  = attack_extra.get("budget_tier", "256")
                 ldr = PuzzleLoader(pf)
-                self._pool_size = ldr.count(bt)
+                if bt == "mixed":
+                    self._pool_size = min(ldr.count(t) for t in ["128", "256", "512"])
+                else:
+                    self._pool_size = ldr.count(bt)
             except Exception:
                 pass
 
@@ -1017,9 +1026,8 @@ class AttackOrchestrator:
             ttft_hol_threshold=5.0,
             itl_cv_thrash_threshold=0.5,
             regressor_backend="linear",
-            baseline_cache_path="results/baseline_cache.json",
-            history_path="results/probe_history.jsonl",
-            run_log_path=self._run_log_path,
+            baseline_cache_path="probes/results/baseline_cache.json",
+            history_path="probes/results/probe_history.jsonl",
         )
         return ITLProbes(cfg)
 
@@ -1090,19 +1098,8 @@ class AttackOrchestrator:
             )
             return False
 
-        _PREFLIGHT_TIMEOUT = 90.0
         try:
-            result = await asyncio.wait_for(attack.run(), timeout=_PREFLIGHT_TIMEOUT)
-        except asyncio.TimeoutError:
-            await attack.close()
-            _print(
-                f"  [yellow]Pre-flight timed out after {_PREFLIGHT_TIMEOUT:.0f}s "
-                f"(rate-limited or reasoning overhead). Continuing anyway.[/yellow]"
-                if _RICH else
-                f"  Pre-flight timed out after {_PREFLIGHT_TIMEOUT:.0f}s "
-                f"(rate-limited or reasoning overhead). Continuing anyway."
-            )
-            return True
+            result = await attack.run()
         except Exception as exc:
             _print(
                 f"  [bold red]Pre-flight FAILED (request): {exc}[/bold red]"
@@ -1469,31 +1466,9 @@ class AttackOrchestrator:
     # ── Main run ──────────────────────────────────────────────────────
 
     async def run(self) -> None:
-        # Write run metadata as the first line of the per-run probe log so it
-        # can be used to align probe timestamps with external vLLM metrics.
-        from pathlib import Path as _Path
-        meta: dict = {
-            "type":         "run_meta",
-            "timestamp":    time.time(),
-            "timestamp_iso": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "model":        self.target.model,
-            "target_url":   self.target.base_url,
-            "attack_type":  self.attack_type,
-            "n_instances":  self.n_instances,
-            "max_tokens":   self.max_tokens,
-            "token_budget": self.token_budget,
-        }
-        if self.attack_type == "reasoning_bomb":
-            meta["puzzle_file"] = self.attack_extra.get("puzzle_file")
-            meta["budget_tier"] = self.attack_extra.get("budget_tier")
-        elif self.attack_type == "think_trap":
-            meta["prompts_file"] = self.attack_extra.get("prompts_file")
-        _p = _Path(self._run_log_path)
-        _p.parent.mkdir(parents=True, exist_ok=True)
-        _p.write_text(json.dumps(meta) + "\n")
-
         # Step 1 — baseline
-        await self.run_baseline()
+        if not self.skip_probing:
+            await self.run_baseline()
 
         # Step 2 — pre-flight (verify endpoint + payload before launching N instances)
         ok = await self.preflight_check()
@@ -1541,7 +1516,6 @@ class AttackOrchestrator:
             f"  Stream rd delay : {read_delay_str}\n"
             f"  Budget          : {f'{self.token_budget:,}' if self.token_budget else 'unlimited'}\n"
             f"  System prompt   : {sp_display}\n"
-            f"  Probe log       : [dim]{self._run_log_path}[/dim]\n"
             f"  Press [bold]Ctrl+C[/bold] to stop.\n"
             if _RICH else
             f"\n── Launching Attack ──\n"
@@ -1554,7 +1528,6 @@ class AttackOrchestrator:
             f"  Stream rd delay : {read_delay_str}\n"
             f"  Budget          : {f'{self.token_budget:,}' if self.token_budget else 'unlimited'}\n"
             f"  System prompt   : {sp_display}\n"
-            f"  Probe log       : {self._run_log_path}\n"
             f"  Press Ctrl+C to stop.\n"
         )
 
@@ -1620,81 +1593,6 @@ class AttackOrchestrator:
             )
             self._print_summary(run_result)
 
-    def _write_attack_log(self, result: Any) -> None:
-        """Write a complete attack metrics JSON to self._attack_log_path."""
-        from pathlib import Path as _Path
-
-        baseline: dict = {}
-        if self._probes:
-            cfg = self._probes.config
-            baseline = {
-                "itl_ms":  round(cfg.baseline_itl_ms, 4),
-                "ttft_s":  round(cfg.baseline_ttft_s, 4),
-                "kv_est":  round(cfg.baseline_kv_est,  4),
-            }
-
-        extra_meta: dict = {}
-        if self.attack_type == "reasoning_bomb":
-            extra_meta["puzzle_file"] = self.attack_extra.get("puzzle_file")
-            extra_meta["budget_tier"] = self.attack_extra.get("budget_tier")
-        elif self.attack_type == "think_trap":
-            extra_meta["prompts_file"] = self.attack_extra.get("prompts_file")
-
-        doc = {
-            "run_meta": {
-                "start_time":            result.start_time,
-                "start_time_iso":        datetime.datetime.fromtimestamp(
-                    result.start_time, tz=datetime.timezone.utc
-                ).isoformat(),
-                "model":                 self.target.model,
-                "target_url":            self.target.base_url,
-                "api_format":            self.target.api_format.value,
-                "attack_type":           self.attack_type,
-                "n_instances":           self.n_instances,
-                "max_tokens":            self.max_tokens,
-                "token_budget":          self.token_budget,
-                "launch_stagger_s":      self.launch_stagger_s,
-                "max_tokens_spread_pct": self.max_tokens_spread_pct,
-                "stream_read_delay_s":   self.stream_read_delay_s,
-                **extra_meta,
-            },
-            "timing": {
-                "wall_clock_s": round(result.wall_clock_s, 2),
-            },
-            "requests": {
-                "total":        result.total_requests,
-                "succeeded":    result.successful,
-                "failed":       result.failed,
-                "timed_out":    result.timed_out,
-                "cancelled":    result.cancelled,
-                "success_rate": round(result.success_rate, 4),
-            },
-            "tokens": {
-                "total_input":              result.total_prompt_tokens,
-                "total_output":             result.total_generated_tokens,
-                "total_completion":         result.total_completion_tokens,
-                "total_reasoning":          result.total_reasoning_tokens,
-                "mean_amplification_ratio": round(result.mean_amplification_ratio, 2),
-                "p95_amplification_ratio":  round(result.p95_amplification_ratio, 2),
-                "tokens_per_second":        round(result.tokens_generated_per_second, 2),
-            },
-            "latency": {
-                "mean_ttft_s":         round(result.mean_ttft_s, 4),
-                "p95_ttft_s":          round(result.p95_ttft_s, 4),
-                "mean_duration_s":     round(result.mean_total_duration_s, 3),
-                "p95_duration_s":      round(result.p95_total_duration_s, 3),
-                "requests_per_second": round(result.requests_per_second, 4),
-            },
-            "baseline":             baseline,
-            "infra_state_timeline": result.state_timeline,
-            "instance_stats":       result.instance_stats,
-            "per_request":          [r.to_dict() for r in result.all_results],
-        }
-
-        p = _Path(self._attack_log_path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(doc, indent=2))
-
     def _print_summary(self, result: Any) -> None:
         _print(
             "\n[bold #8B0000]── Attack Summary ──[/bold #8B0000]" if _RICH
@@ -1719,17 +1617,9 @@ class AttackOrchestrator:
             t.add_row("Mean TTFT",         f"{result.mean_ttft_s:.2f}s")
             t.add_row("Mean duration",     f"{result.mean_total_duration_s:.1f}s")
             console.print(t)
+
         else:
             print(result.summary())
-
-        self._write_attack_log(result)
-        _print(
-            f"\n  [dim]Attack log : {self._attack_log_path}[/dim]\n"
-            f"  [dim]Probe log  : {self._run_log_path}[/dim]"
-            if _RICH else
-            f"\n  Attack log : {self._attack_log_path}"
-            f"\n  Probe log  : {self._run_log_path}"
-        )
 
 
 # ─────────────────────────────────────────────
@@ -1808,6 +1698,20 @@ def main() -> None:
         import dataclasses
         target = dataclasses.replace(target, system_prompt=system_prompt_raw)
 
+    _print(
+        "\n  [dim]Request prefix — prepended to every attack and probe message. "
+        "A shared prefix pins all requests to the same KV-cache slot via "
+        "prefix-aware routing. Leave blank to omit.[/dim]"
+        if _RICH else
+        "\n  Request prefix — prepended to every attack and probe message.\n"
+        "  A shared prefix pins requests to the same KV-cache slot via\n"
+        "  prefix-aware routing. Leave blank to omit."
+    )
+    request_prefix_raw = _ask("Request prefix (leave blank to omit)")
+    if request_prefix_raw:
+        import dataclasses
+        target = dataclasses.replace(target, request_prefix=request_prefix_raw)
+
     params  = gather_attack_params(target)
 
     orchestrator = AttackOrchestrator(
@@ -1820,6 +1724,7 @@ def main() -> None:
         launch_stagger_s=params["launch_stagger_s"],
         max_tokens_spread_pct=params["max_tokens_spread_pct"],
         stream_read_delay_s=params["stream_read_delay_s"],
+        skip_probing=params["skip_probing"],
     )
 
     try:

@@ -555,8 +555,10 @@ class ITLProbes:
     # ── Payload construction ──────────────────────────────────────────────────
 
     def _build_payload(self, prompt: str, max_tokens: int, stream: bool = True) -> dict:
-        fmt = self.config.target.api_format
-        sp  = self.config.target.system_prompt
+        fmt    = self.config.target.api_format
+        sp     = self.config.target.system_prompt
+        prefix = self.config.target.request_prefix
+        prompt = f"{prefix}{prompt}" if prefix else prompt
 
         # Vertex AI uses a completely different schema
         if fmt == APIFormat.VERTEX:

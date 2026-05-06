@@ -3,3 +3,8 @@ secret.py
 claude.txt
 pod_setup.txt
 
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+

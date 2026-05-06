@@ -696,7 +696,9 @@ class ThinkTrapAttack(BaseAttack):
         sp = self._effective_system_prompt()
         if sp:
             messages.append({"role": "system", "content": sp})
-        messages.append({"role": "user", "content": prompt})
+        prefix = self.config.target.request_prefix
+        content = f"{prefix}{prompt}" if prefix else prompt
+        messages.append({"role": "user", "content": content})
         return messages
 
     def _template_payload(self, prompt: str) -> dict[str, Any]:

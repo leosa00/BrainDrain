@@ -58,6 +58,7 @@ class TargetConfig:
     extra_headers:        dict[str, str] = field(default_factory=dict)
     supports_stream_options: bool = True
     system_prompt:        Optional[str] = None
+    request_prefix:       Optional[str] = None
     # If set, used as the base request body instead of the built-in payload
     # builders. The string "__PROMPT__" anywhere in the template is replaced
     # with the attack prompt at runtime.
