@@ -206,7 +206,7 @@ Both fields are sent with every attack and probe request.
 - **System prompt** — set as the `system` field (Anthropic format) or as a system-role message (OpenAI format).
 - **Request prefix** — prepended to the user message content of every request (attack and probe).
 
-A shared prefix pins all concurrent requests to the same KV-cache slot via prefix-aware routing on vLLM (Automatic Prefix Caching). This maximises cache pressure on a single memory region, making the attack more effective against single-node deployments.
+A shared prefix pins all concurrent requests to the same KV-cache slot via prefix-aware routing on vLLM (Automatic Prefix Caching). This maximises cache pressure on a single memory region, making the attack more effective.
 
 ---
 
@@ -268,8 +268,7 @@ Path to puzzle JSON file [prompts/reasoningBomb_puzzles.json]:
 Puzzle budget tier (128 / 256 / 512 / mixed) [256]:
 ```
 
-**Puzzle file:** Path to the `sample_puzzles.json` from the [ReasoningBomb GitHub repo](https://github.com/SaFo-Lab/ReasoningBomb/blob/main/data/sample_puzzles.json). Save it to `prompts/reasoningBomb_puzzles.json` or provide an absolute path.
-
+**Puzzle file:** Path to the `sample_puzzles.json` from the [ReasoningBomb GitHub repo](https://github.com/SaFo-Lab/ReasoningBomb/blob/main/data/sample_puzzles.json).
 **Budget tier:** The token-budget tier of puzzles to draw from. Puzzles in each tier are designed to induce a specific reasoning depth in the model.
 
 | Tier | Prompt length | Typical amplification |
@@ -305,7 +304,6 @@ Launch stagger between instances (seconds, 0=off) [0.0]:
 
 Delay between starting each successive instance. Staggered launch times cause instances to complete at different wall-clock times, maintaining continuous KV-cache pressure even across request boundaries.
 
-**Rule of thumb:** `estimated_request_duration / n_instances`. For example, if each request takes ~60 seconds and you run 4 instances, a stagger of 15 seconds distributes completion times evenly.
 
 #### Max-token spread
 
