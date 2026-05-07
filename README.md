@@ -449,11 +449,118 @@ T, _ = load_surrogate_embeddings("", embeddings_path="llama2_embeddings.npy")
 
 ---
 
+## Script interface (non-interactive)
+
+`bdscript.py` mirrors every wizard option as a command-line flag, suitable for automated or headless deployments where no human is present at the keyboard — cron jobs, CI pipelines, or distributed test rigs.
+
+```bash
+python bdscript.py --help
+```
+
+### Flag reference
+
+| Flag | Wizard equivalent | Default |
+|---|---|---|
+| `-t / --target URL` | Target URL | — (required) |
+| `-m / --model NAME` | Model name | — (required except vertex/custom) |
+| `-f / --format FORMAT` | API format | `openai` |
+| `-k / --api-key KEY` | API key | — |
+| `--timeout SECONDS` | Request timeout | none |
+| `--no-stream-options` | stream_options prompt (Ollama) | off |
+| `--no-verify-ssl` | — | off |
+| `-S / --system-prompt TEXT` | System prompt | — |
+| `--request-prefix TEXT` | Request prefix | — |
+| `--custom-descriptor PATH` | Custom JSON descriptor | — |
+| `--response-format FORMAT` | Custom response format | `openai` |
+| `-a / --attack TYPE` | Attack type | `reasoning_bomb` |
+| `-n / --instances N` | Concurrent instances | `4` |
+| `--max-tokens N` | Max tokens per request | auto-detected |
+| `--budget TOKENS` | Token budget | unlimited |
+| `--no-preflight` | — | off |
+| `--puzzle-file PATH` | Puzzle JSON file | `prompts/reasoningBomb_puzzles.json` |
+| `--budget-tier TIER` | Budget tier | `256` |
+| `--prompts-file PATH` | ThinkTrap prompts file | `prompts/thinktrap_prompts.json` |
+| `--stagger SECONDS` | Launch stagger | `0` |
+| `--spread PERCENT` | Max-token spread | `0` |
+| `--stream-delay SECONDS` | Stream read delay | `0` |
+| `--no-probe` | ITL probing toggle | off |
+| `-o / --output PATH` | — | — |
+
+### `--output` JSON format
+
+When `--output results.json` is provided, a JSON file is written after the attack with two top-level keys:
+
+```json
+{
+  "config": {
+    "target": "http://10.0.0.1:8000",
+    "model": "deepseek-r1-7b",
+    "format": "openai",
+    "attack": "reasoning_bomb",
+    "instances": 8,
+    "max_tokens": 16384,
+    "budget": null,
+    "budget_tier": "256",
+    "stagger_s": 8.0,
+    "spread_pct": 25.0,
+    "stream_delay_s": 0.01,
+    "no_probe": false,
+    "system_prompt": null,
+    "request_prefix": null
+  },
+  "result": {
+    "wall_clock_s": 120.5,
+    "total_requests": 47,
+    "successful": 45,
+    "failed": 2,
+    "mean_amplification_ratio": 312.4,
+    "total_generated_tokens": 741280,
+    "tokens_generated_per_second": 6151.0,
+    "state_timeline": [[0.0, "idle"], [12.3, "filling"], [28.7, "saturated"]],
+    "instance_stats": [...]
+  }
+}
+```
+
+### Examples
+
+```bash
+# Minimal — reasoning bomb, 4 instances, auto-detect tokens
+python bdscript.py -t http://localhost:8000 -m deepseek-r1-7b
+
+# ThinkTrap with full pressure options and JSON output
+python bdscript.py \
+    -t http://10.0.0.1:8000 -m qwen3-32b \
+    --attack think_trap --instances 8 \
+    --stagger 4.0 --spread 25 --stream-delay 0.01 \
+    --system-prompt "You are a helpful assistant." \
+    --output results/run_001.json
+
+# Anthropic API target
+python bdscript.py \
+    -t https://api.anthropic.com -m claude-opus-4-5 \
+    --format anthropic --api-key sk-ant-... \
+    --attack reasoning_bomb --budget-tier 128 --instances 6
+
+# Custom descriptor (e.g. Vertex AI with extended-thinking headers)
+python bdscript.py \
+    --format custom --custom-descriptor descriptor.json \
+    --response-format anthropic --model claude-opus-4-5 \
+    --attack reasoning_bomb --instances 4 --output results/vertex.json
+
+# Run on multiple machines simultaneously (collect outputs centrally)
+ssh node1 "cd BrainDrain && python bdscript.py -t http://target:8000 -m deepseek-r1-7b -n 8 -o /tmp/node1.json"
+ssh node2 "cd BrainDrain && python bdscript.py -t http://target:8000 -m deepseek-r1-7b -n 8 -o /tmp/node2.json"
+```
+
+---
+
 ## File layout
 
 ```
 BrainDrain/
-├── BrainDrain.py              # CLI entry point (run this)
+├── BrainDrain.py              # Interactive wizard CLI
+├── bdscript.py                # Non-interactive script interface
 ├── attacks/
 │   ├── reasoning_bomb.py      # ReasoningBomb attack module
 │   └── think_trap.py          # ThinkTrap attack module (APG + DSA)
