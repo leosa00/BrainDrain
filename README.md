@@ -220,7 +220,7 @@ Attack type (reasoning_bomb / think_trap) [reasoning_bomb]:
 
 | Type | Description |
 |---|---|
-| `reasoning_bomb` | Feeds short math/logic puzzles to a Large Reasoning Model. The model's extended chain-of-thought produces a pathologically long reasoning trace, achieving a very high output/input token amplification ratio. Based on [Liu et al., 2026](https://arxiv.org/abs/2602.00154). Requires puzzle JSON file. |
+| `reasoning_bomb` | Feeds short math/logic puzzles to a Large Reasoning Model. The model's extended chain-of-thought produces a pathologically long reasoning trace, achieving a very high output/input token amplification ratio. Based on [Liu et al., 2026](https://arxiv.org/abs/2602.00154). Requires puzzle JSON file. **Only effective against Large Reasoning Models (LRMs)** — models with an extended chain-of-thought/thinking capability such as DeepSeek-R1, QwQ, Gemini 2.5, and Claude 3.7+ Sonnet. Standard instruction-tuned models without a reasoning mode will not produce the long traces the attack relies on and the amplification ratio will be negligible. |
 | `think_trap` | Injects pre-optimised adversarial prompts generated offline by a CMA-ES search that maximised output token count against a surrogate model. Based on [Li et al., NDSS 2026](https://arxiv.org/abs/2512.07086). Requires a prompt cache JSON file. |
 
 ---
