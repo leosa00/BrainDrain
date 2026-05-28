@@ -1,0 +1,9 @@
+{
+  "baseline_itl_ms": 22.679844386054405,
+  "baseline_ttft_s": 0.15569651639962104,
+  "baseline_kv_est": 0.0022960046157277036,
+  "baseline_pure_itl_ms": 21.640651635948416,
+  "target_url": "http://34.90.134.67",
+  "model": "deepseek-r1-14b",
+  "saved_at": "2026-05-28T15:50:34.855279+00:00"
+}

@@ -81,7 +81,7 @@ class DDoSRunResult:
 
     @property
     def total_generated_tokens(self) -> int:
-        return self.total_completion_tokens + self.total_reasoning_tokens
+        return self.total_completion_tokens
 
     def to_dict(self) -> dict:
         return {

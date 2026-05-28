@@ -75,6 +75,9 @@ class ReasoningBombConfig:
     # When True the module prints per-chunk token deltas (useful for debugging).
     verbose_stream: bool = False
 
+    # Prepend a short random nonce to each request to defeat KV prefix caching.
+    cache_bust: bool = False
+
     def __post_init__(self) -> None:
         if self.budget_tier not in BUDGET_TIERS:
             raise ValueError(
@@ -226,6 +229,7 @@ class ReasoningBombAttack(BaseAttack):
         self.rb_config = rb_config or ReasoningBombConfig()
         self._loader = PuzzleLoader(self.rb_config.puzzle_file)
         self._selected_puzzle: Optional[str] = None
+        self._puzzle_token_count: int = 0
 
     # ── Identity ─────────────────────────────
 
@@ -245,9 +249,23 @@ class ReasoningBombAttack(BaseAttack):
             self.rb_config.puzzle_index,
         )
         self._selected_puzzle = puzzle
+
+        nonce: Optional[str] = None
+        if self.rb_config.cache_bust:
+            import uuid
+            nonce = uuid.uuid4().hex[:8]
+            puzzle = f"[id:{nonce}] {puzzle}"
+
+        # Use the tier value as the canonical prompt token count.
+        # The dataset defines each tier by its token budget (128 / 256 / 512),
+        # so this is more accurate than whatever the target API reports (which
+        # includes system-prompt overhead, BOS tokens, etc.).
+        self._puzzle_token_count: int = int(self.rb_config.budget_tier)
+
         self.config.metadata = {
             "budget_tier": self.rb_config.budget_tier,
             "puzzle_preview": puzzle[:120],
+            "cache_bust_nonce": nonce,
         }
 
         if self.config.target.request_template:
@@ -284,8 +302,13 @@ class ReasoningBombAttack(BaseAttack):
     def _template_payload(self, puzzle: str) -> dict[str, Any]:
         """Use request_template as the base body, injecting the puzzle prompt."""
         import copy
+
+        # Prepend request_prefix before substitution (mirrors _build_messages behaviour)
+        prefix = self.config.target.request_prefix or ""
+        content = f"{prefix}{puzzle}" if prefix else puzzle
+
         payload = copy.deepcopy(self.config.target.request_template)
-        payload_str = json.dumps(payload).replace('"__PROMPT__"', json.dumps(puzzle))
+        payload_str = json.dumps(payload).replace('"__PROMPT__"', json.dumps(content))
         payload = json.loads(payload_str)
         payload["stream"] = True
         payload["max_tokens"] = self.config.max_tokens
@@ -294,6 +317,25 @@ class ReasoningBombAttack(BaseAttack):
         if self.config.max_tokens <= 64:
             payload.pop("reasoning", None)
             payload.pop("thinking", None)
+
+        # Inject system prompt if set and not already present in the template.
+        # Only adds — never overwrites — so a system prompt baked into the
+        # descriptor body takes precedence.
+        sp = self._effective_system_prompt()
+        if sp:
+            fmt = self.config.target.api_format
+            if fmt == APIFormat.ANTHROPIC:
+                if "system" not in payload:
+                    payload["system"] = sp
+            elif fmt == APIFormat.VERTEX:
+                if "systemInstruction" not in payload:
+                    payload["systemInstruction"] = {"parts": [{"text": sp}]}
+            else:  # OpenAI / Ollama
+                messages = payload.get("messages", [])
+                if not any(m.get("role") == "system" for m in messages):
+                    messages.insert(0, {"role": "system", "content": sp})
+                    payload["messages"] = messages
+
         return payload
 
     def _openai_payload(self, puzzle: str) -> dict[str, Any]:
@@ -390,7 +432,7 @@ class ReasoningBombAttack(BaseAttack):
     # Ollama sends usage in the final chunk alongside choices (not separately)
         usage = data.get("usage")
         if usage:
-            result.token_metrics.prompt_tokens     = usage.get("prompt_tokens", 0)
+            result.token_metrics.prompt_tokens     = self._puzzle_token_count
             result.token_metrics.completion_tokens = usage.get("completion_tokens", 0)
 
         choices = data.get("choices", [])
@@ -431,12 +473,13 @@ class ReasoningBombAttack(BaseAttack):
         # The old guard `data.get("choices") is None` missed the vLLM case.
         usage = data.get("usage")
         if usage:
-            result.token_metrics.prompt_tokens     = usage.get("prompt_tokens", 0) or result.token_metrics.prompt_tokens
-            result.token_metrics.completion_tokens = usage.get("completion_tokens", 0) or result.token_metrics.completion_tokens
+            result.token_metrics.prompt_tokens     = self._puzzle_token_count
             details = usage.get("completion_tokens_details") or {}
             rt = details.get("reasoning_tokens", 0)
-            if rt:
-                result.token_metrics.reasoning_tokens = rt
+            # completion_tokens is the full output (answer + reasoning combined).
+            # reasoning_tokens is stored separately as a breakdown metric only.
+            result.token_metrics.completion_tokens = usage.get("completion_tokens", 0) or result.token_metrics.completion_tokens
+            result.token_metrics.reasoning_tokens  = rt
 
         choices = data.get("choices") or []
         if not choices:
@@ -481,15 +524,14 @@ class ReasoningBombAttack(BaseAttack):
             usage = data.get("usage", {})
             result.token_metrics.completion_tokens = usage.get("output_tokens", 0)
         if event_type == "message_start":
-            usage = data.get("message", {}).get("usage", {})
-            result.token_metrics.prompt_tokens = usage.get("input_tokens", 0)
+            result.token_metrics.prompt_tokens = self._puzzle_token_count
         return None
 
     def _parse_ollama_chunk(
         self, data: dict, result: AttackResult
     ) -> Optional[str]:
         if data.get("done"):
-            result.token_metrics.prompt_tokens     = data.get("prompt_eval_count", 0)
+            result.token_metrics.prompt_tokens     = self._puzzle_token_count
             result.token_metrics.completion_tokens = data.get("eval_count", 0)
             return None
         return data.get("message", {}).get("content")
@@ -500,9 +542,7 @@ class ReasoningBombAttack(BaseAttack):
         # usageMetadata appears in the final chunk
         usage = data.get("usageMetadata", {})
         if usage:
-            result.token_metrics.prompt_tokens = (
-                usage.get("promptTokenCount", 0) or result.token_metrics.prompt_tokens
-            )
+            result.token_metrics.prompt_tokens = self._puzzle_token_count
             result.token_metrics.completion_tokens = (
                 usage.get("candidatesTokenCount", 0) or result.token_metrics.completion_tokens
             )
@@ -542,9 +582,9 @@ class ReasoningBombAttack(BaseAttack):
 
         if fmt in (APIFormat.OPENAI, APIFormat.CUSTOM, APIFormat.TEST):
             usage = data.get("usage", {})
-            result.token_metrics.prompt_tokens     = usage.get("prompt_tokens", 0)
-            result.token_metrics.completion_tokens = usage.get("completion_tokens", 0)
+            result.token_metrics.prompt_tokens     = self._puzzle_token_count
             details = usage.get("completion_tokens_details", {})
+            result.token_metrics.completion_tokens = usage.get("completion_tokens", 0)
             result.token_metrics.reasoning_tokens  = details.get("reasoning_tokens", 0)
             choices = data.get("choices", [])
             if choices:
@@ -558,7 +598,7 @@ class ReasoningBombAttack(BaseAttack):
 
         elif fmt == APIFormat.ANTHROPIC:
             usage = data.get("usage", {})
-            result.token_metrics.prompt_tokens     = usage.get("input_tokens", 0)
+            result.token_metrics.prompt_tokens     = self._puzzle_token_count
             result.token_metrics.completion_tokens = usage.get("output_tokens", 0)
             contents = data.get("content", [])
             result.raw_response = " ".join(
@@ -566,13 +606,13 @@ class ReasoningBombAttack(BaseAttack):
             )
 
         elif fmt == APIFormat.OLLAMA:
-            result.token_metrics.prompt_tokens     = data.get("prompt_eval_count", 0)
+            result.token_metrics.prompt_tokens     = self._puzzle_token_count
             result.token_metrics.completion_tokens = data.get("eval_count", 0)
             result.raw_response = data.get("message", {}).get("content", "")
 
         elif fmt == APIFormat.VERTEX:
             usage = data.get("usageMetadata", {})
-            result.token_metrics.prompt_tokens     = usage.get("promptTokenCount", 0)
+            result.token_metrics.prompt_tokens     = self._puzzle_token_count
             result.token_metrics.completion_tokens = usage.get("candidatesTokenCount", 0)
             result.token_metrics.reasoning_tokens  = usage.get("thoughtsTokenCount", 0)
             candidates = data.get("candidates", [])

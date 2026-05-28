@@ -1,1 +1,0 @@
-{"type": "run_meta", "timestamp": 1778052323.2790694, "timestamp_iso": "2026-05-06T07:25:23.279070+00:00", "model": "", "target_url": "http://", "attack_type": "reasoning_bomb", "n_instances": 4, "max_tokens": 16384, "token_budget": null, "puzzle_file": "prompts/reasoningBomb_puzzles.json", "budget_tier": "256"}

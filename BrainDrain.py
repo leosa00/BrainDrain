@@ -14,6 +14,7 @@ import json
 import logging
 import sys
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import aiohttp
@@ -148,8 +149,23 @@ def _classify_error(error: str) -> Optional[str]:
     """
     Map an error message to a recoverable category.
     Returns None if the error is unclassified / likely transient.
+
+    HTTP status codes are checked first so that body text (e.g. "too many
+    requests" in a 503 body) can never override the explicit status code.
     """
     low = error.lower()
+
+    # ── HTTP status codes — checked first, unambiguous ────────────────
+    if "http 401" in low or "http 403" in low:
+        return "auth"
+    if "http 404" in low:
+        return "model_not_found"
+    if "http 429" in low:
+        return "rate_limit"
+    if "http 502" in low or "http 503" in low or "http 504" in low:
+        return "network"
+
+    # ── Content-based matching for non-HTTP errors ────────────────────
     if any(k in low for k in (
         "context length", "context window", "maximum context",
         "max_tokens", "max tokens", "token limit", "tokens exceed",
@@ -158,20 +174,25 @@ def _classify_error(error: str) -> Optional[str]:
     )):
         return "token_limit"
     if any(k in low for k in (
-        "http 401", "http 403", "unauthorized", "forbidden",
-        "invalid api key", "authentication", "api key",
+        "unauthorized", "forbidden", "invalid api key",
+        "authentication", "api key",
     )):
         return "auth"
     if any(k in low for k in (
-        "http 404", "not found", "no such model",
-        "model not found", "model does not exist",
+        "not found", "no such model", "model not found", "model does not exist",
     )):
         return "model_not_found"
     if any(k in low for k in (
-        "http 429", "rate limit", "too many requests",
-        "quota exceeded", "rate_limit",
+        "rate limit", "too many requests", "quota exceeded", "rate_limit",
     )):
         return "rate_limit"
+    if any(k in low for k in (
+        "connection refused", "connection reset", "cannot connect",
+        "network unreachable", "no route to host", "server disconnected",
+        "clientconnectorerror", "clientoserror", "broken pipe",
+        "bad gateway", "service unavailable", "gateway timeout",
+    )):
+        return "network"
     return None
 
 
@@ -482,6 +503,8 @@ def gather_attack_params(target: TargetConfig) -> dict:
         budget_tier = _choose("Puzzle budget tier", ["128", "256", "512", "mixed"], "256")
         extra["puzzle_file"] = puzzle_file
         extra["budget_tier"] = budget_tier
+        cache_bust = _choose("Cache-bust each request (defeats KV prefix cache)?", ["no", "yes"], "no")
+        extra["cache_bust"] = cache_bust == "yes"
 
     elif attack_type == "think_trap":
         prompts_file = _ask("Path to ThinkTrap prompts JSON file", "prompts/thinktrap_prompts.json")
@@ -821,6 +844,7 @@ def build_attack_factory(
             puzzle_file=puzzle_file,
             budget_tier=effective_tier,
             puzzle_index=puzzle_index,
+            cache_bust=extra.get("cache_bust", False),
         )
         return ReasoningBombAttack, config_factory, {"rb_config": rb_cfg}
 
@@ -974,6 +998,8 @@ class AttackOrchestrator:
         self.max_tokens_spread_pct = max_tokens_spread_pct
         self.stream_read_delay_s  = stream_read_delay_s
         self.skip_probing         = skip_probing
+        self._baseline_data: dict = {}
+        self._probes_csv_fh       = None
 
         self._stop   = asyncio.Event()
         self._queue:  asyncio.Queue = asyncio.Queue()
@@ -1146,6 +1172,7 @@ class AttackOrchestrator:
         itl  = result.get("baseline_itl_ms", 0.0)
         ttft = result.get("baseline_ttft_s", 0.0)
         kv   = result.get("baseline_kv_est",  0.0)
+        self._baseline_data = {"itl_ms": itl, "ttft_s": ttft, "kv_est": kv}
         _print(
             f"  [green]Baseline: ITL={itl:.2f} ms  TTFT={ttft:.4f} s  "
             f"KV(idle)={kv:.4f}[/green]"
@@ -1163,7 +1190,7 @@ class AttackOrchestrator:
             generated = (
                 self._collector._results and
                 sum(
-                    r.token_metrics.completion_tokens + r.token_metrics.reasoning_tokens
+                    r.token_metrics.completion_tokens
                     for r in self._collector._results
                 )
             ) or 0
@@ -1222,6 +1249,7 @@ class AttackOrchestrator:
                 ttft_s=result.ttft_s,
             )
             self._collector.record_state(state)
+            self._write_probe_row(result)
 
         await self._probes.monitor(
             interval_s=self.PROBE_INTERVAL_S,
@@ -1234,10 +1262,7 @@ class AttackOrchestrator:
     async def _refresh_display(self) -> None:
         while not self._stop.is_set() and not self._recovering:
             results = self._collector._results
-            output_tok = sum(
-                r.token_metrics.completion_tokens + r.token_metrics.reasoning_tokens
-                for r in results
-            )
+            output_tok = sum(r.token_metrics.completion_tokens for r in results)
             input_tok = sum(r.token_metrics.prompt_tokens for r in results)
             self._display.update(
                 requests=len(results),
@@ -1308,10 +1333,11 @@ class AttackOrchestrator:
 
         # ── Per-category prompt ───────────────────────────────────────
         LABELS = {
-            "token_limit":   "Max tokens per request",
-            "auth":          "API key",
+            "token_limit":     "Max tokens per request",
+            "auth":            "API key",
             "model_not_found": "Model name",
-            "rate_limit":    "Delay between requests (seconds)",
+            "rate_limit":      "Delay between requests (seconds)",
+            "network":         "Target URL",
         }
         label = LABELS.get(category, "Unknown error")
 
@@ -1445,18 +1471,31 @@ class AttackOrchestrator:
                             f"\n  [attack error] {result.error}"
                         )
 
-                    # Trigger recovery once we have enough consecutive failures
-                    # with a classifiable, actionable error.
+                    # Trigger interactive recovery for config-level errors that
+                    # require user action. Network/transient errors are handled
+                    # by the 2 s backoff in run_loop — never pause instances for
+                    # them, because cancelling all tasks stops all requests.
                     if (
                         self._consecutive_failures >= RECOVERY_CONSECUTIVE
                         and not self._recovering
                         and not self._recovery_triggered.is_set()
                     ):
                         category = _classify_error(result.error)
-                        if category:
+                        if category in ("token_limit", "auth", "model_not_found", "rate_limit"):
                             self._recovery_error    = result.error
                             self._recovery_category = category
                             self._recovery_triggered.set()
+                        else:
+                            # Transient / network error — warn and reset counter
+                            # so we don't re-evaluate on every subsequent failure.
+                            _print(
+                                f"\n  [yellow]⚠ {self._consecutive_failures} consecutive failures "
+                                f"(transient — retrying): {result.error[:100]}[/yellow]"
+                                if _RICH else
+                                f"\n  ⚠ {self._consecutive_failures} consecutive failures "
+                                f"(transient — retrying): {result.error[:100]}"
+                            )
+                            self._consecutive_failures = 0
                 else:
                     self._consecutive_failures = 0
 
@@ -1531,11 +1570,14 @@ class AttackOrchestrator:
             f"  Press Ctrl+C to stop.\n"
         )
 
-        # Step 2 — create instances
+        # Step 2 — open JSONL files before launching so every result is captured
+        self._open_jsonl_files()
+
+        # Step 3 — create instances
         for i in range(self.n_instances):
             self._instances.append(self._make_instance(i))
 
-        # Step 3 — launch tasks
+        # Step 4 — launch tasks
         for inst in self._instances:
             task = asyncio.create_task(inst.run_loop(self._queue, self._stop))
             self._tasks.append(task)
@@ -1592,6 +1634,144 @@ class AttackOrchestrator:
                 instance_stats=[inst.stats for inst in self._instances]
             )
             self._print_summary(run_result)
+            self._close_jsonl_files()
+            self._save_run_json(run_result)
+
+    # ── JSONL output ──────────────────────────────────────────────────
+
+    @property
+    def _run_tag(self) -> str:
+        slug = self.target.model.replace("/", "-")
+        if self.attack_type == "reasoning_bomb":
+            return f"{slug}-{self.attack_extra.get('budget_tier', 'unknown')}"
+        return slug
+
+    def _run_meta_line(self) -> str:
+        from datetime import datetime, timezone
+        meta: dict = {
+            "type":         "run_meta",
+            "timestamp":    self._collector._start_time,
+            "timestamp_iso": datetime.fromtimestamp(
+                self._collector._start_time, tz=timezone.utc
+            ).isoformat(),
+            "model":        self.target.model,
+            "target_url":   self.target.base_url,
+            "attack_type":  self.attack_type,
+            "n_instances":  self.n_instances,
+            "max_tokens":   self.max_tokens,
+            "token_budget": self.token_budget,
+        }
+        if self.attack_type == "reasoning_bomb":
+            meta["puzzle_file"] = self.attack_extra.get("puzzle_file", "")
+            meta["budget_tier"] = self.attack_extra.get("budget_tier", "")
+        elif self.attack_type == "think_trap":
+            meta["prompts_file"] = self.attack_extra.get("prompts_file", "")
+        return json.dumps(meta)
+
+    def _open_jsonl_files(self) -> None:
+        results_dir = Path(__file__).parent / "results"
+        results_dir.mkdir(exist_ok=True)
+        tag = self._run_tag
+        meta_line = self._run_meta_line()
+
+        self._probes_csv_fh = open(
+            results_dir / f"{tag}_probes.jsonl", "w", encoding="utf-8"
+        )
+        self._probes_csv_fh.write(meta_line + "\n")
+        self._probes_csv_fh.flush()
+
+        _print(
+            f"\n  [dim]Saving to results/{tag}_probes.jsonl[/dim]"
+            if _RICH else
+            f"\n  Saving to results/{tag}_probes.jsonl"
+        )
+
+    def _write_probe_row(self, probe: Any) -> None:
+        if self._probes_csv_fh is None:
+            return
+        self._probes_csv_fh.write(json.dumps(probe.to_dict()) + "\n")
+        self._probes_csv_fh.flush()
+
+    def _close_jsonl_files(self) -> None:
+        for fh in (self._probes_csv_fh,):
+            if fh:
+                try:
+                    fh.flush()
+                    fh.close()
+                except Exception:
+                    pass
+
+    def _build_run_json(self, result: Any) -> dict:
+        from datetime import datetime, timezone
+        extra = self.attack_extra
+        doc: dict = {
+            "run_meta": {
+                "start_time":            result.start_time,
+                "start_time_iso":        datetime.fromtimestamp(
+                                             result.start_time, tz=timezone.utc
+                                         ).isoformat(),
+                "model":                 self.target.model,
+                "target_url":            self.target.base_url,
+                "api_format":            self.target.api_format.value,
+                "attack_type":           self.attack_type,
+                "n_instances":           self.n_instances,
+                "max_tokens":            self.max_tokens,
+                "token_budget":          self.token_budget,
+                "launch_stagger_s":      self.launch_stagger_s,
+                "max_tokens_spread_pct": self.max_tokens_spread_pct,
+                "stream_read_delay_s":   self.stream_read_delay_s,
+            },
+            "timing": {
+                "wall_clock_s": round(result.wall_clock_s, 2),
+            },
+            "requests": {
+                "total":        result.total_requests,
+                "succeeded":    result.successful,
+                "failed":       result.failed,
+                "timed_out":    result.timed_out,
+                "cancelled":    result.cancelled,
+                "success_rate": round(result.success_rate, 4),
+            },
+            "tokens": {
+                "total_input":              result.total_prompt_tokens,
+                "total_output":             result.total_generated_tokens,
+                "total_completion":         result.total_completion_tokens,
+                "total_reasoning":          result.total_reasoning_tokens,
+                "mean_amplification_ratio": round(result.mean_amplification_ratio, 2),
+                "p95_amplification_ratio":  round(result.p95_amplification_ratio, 2),
+                "tokens_per_second":        round(result.tokens_generated_per_second, 2),
+            },
+            "latency": {
+                "mean_ttft_s":         round(result.mean_ttft_s, 4),
+                "p95_ttft_s":          round(result.p95_ttft_s, 4),
+                "mean_duration_s":     round(result.mean_total_duration_s, 3),
+                "p95_duration_s":      round(result.p95_total_duration_s, 3),
+                "requests_per_second": round(result.requests_per_second, 4),
+            },
+            "baseline":             self._baseline_data,
+            "infra_state_timeline": result.state_timeline,
+            "instance_stats":       result.instance_stats,
+            "per_request":          [r.to_dict() for r in result.all_results],
+        }
+        if self.attack_type == "reasoning_bomb":
+            doc["run_meta"]["puzzle_file"] = extra.get("puzzle_file", "")
+            doc["run_meta"]["budget_tier"] = extra.get("budget_tier", "")
+        elif self.attack_type == "think_trap":
+            doc["run_meta"]["prompts_file"] = extra.get("prompts_file", "")
+        return doc
+
+    def _save_run_json(self, result: Any) -> None:
+        results_dir = Path(__file__).parent / "results"
+        results_dir.mkdir(exist_ok=True)
+        out = results_dir / f"{self._run_tag}_attack.json"
+        doc = self._build_run_json(result)
+        with out.open("w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+        _print(
+            f"  [green]Summary saved → {out}[/green]" if _RICH
+            else f"  Summary saved → {out}"
+        )
+
 
     def _print_summary(self, result: Any) -> None:
         _print(

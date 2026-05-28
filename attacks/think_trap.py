@@ -703,14 +703,38 @@ class ThinkTrapAttack(BaseAttack):
 
     def _template_payload(self, prompt: str) -> dict[str, Any]:
         import copy
+
+        # Prepend request_prefix before substitution (mirrors _build_messages behaviour)
+        prefix = self.config.target.request_prefix or ""
+        content = f"{prefix}{prompt}" if prefix else prompt
+
         payload = copy.deepcopy(self.config.target.request_template)
-        payload_str = json.dumps(payload).replace('"__PROMPT__"', json.dumps(prompt))
+        payload_str = json.dumps(payload).replace('"__PROMPT__"', json.dumps(content))
         payload = json.loads(payload_str)
         payload["stream"] = True
         payload["max_tokens"] = self.config.max_tokens
         if self.config.max_tokens <= 64:
             payload.pop("reasoning", None)
             payload.pop("thinking", None)
+
+        # Inject system prompt if set and not already present in the template.
+        # Only adds — never overwrites — so a system prompt baked into the
+        # descriptor body takes precedence.
+        sp = self._effective_system_prompt()
+        if sp:
+            fmt = self.config.target.api_format
+            if fmt == APIFormat.ANTHROPIC:
+                if "system" not in payload:
+                    payload["system"] = sp
+            elif fmt == APIFormat.VERTEX:
+                if "systemInstruction" not in payload:
+                    payload["systemInstruction"] = {"parts": [{"text": sp}]}
+            else:  # OpenAI / Ollama
+                messages = payload.get("messages", [])
+                if not any(m.get("role") == "system" for m in messages):
+                    messages.insert(0, {"role": "system", "content": sp})
+                    payload["messages"] = messages
+
         return payload
 
     def _openai_payload(self, prompt: str) -> dict[str, Any]:

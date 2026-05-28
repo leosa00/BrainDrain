@@ -181,7 +181,15 @@ class AttackerInstance:
                 result = await self.run_once()
                 await result_queue.put(result)
 
-                if self._dynamic_delay_s > 0 and not stop_event.is_set():
+                if result.status == AttackStatus.FAILED and not stop_event.is_set():
+                    err = result.error or ""
+                    if not err.startswith("HTTP "):
+                        # Connection-level failure (server unreachable) — back off
+                        # to avoid hammering a down server.
+                        await asyncio.sleep(2.0)
+                    # HTTP-level errors (503, 429, etc.) mean the server is alive;
+                    # retry immediately to maintain request pressure.
+                elif self._dynamic_delay_s > 0 and not stop_event.is_set():
                     await asyncio.sleep(self._dynamic_delay_s)
 
             except asyncio.CancelledError:

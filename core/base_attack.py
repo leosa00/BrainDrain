@@ -128,14 +128,14 @@ class TokenMetrics:
 
     @property
     def total_tokens(self) -> int:
-        return self.prompt_tokens + self.completion_tokens + self.reasoning_tokens
+        return self.prompt_tokens + self.completion_tokens
 
     @property
     def amplification_ratio(self) -> float:
         """Completion / prompt ratio — key DoS efficiency metric."""
         if self.prompt_tokens == 0:
             return 0.0
-        return (self.completion_tokens + self.reasoning_tokens) / self.prompt_tokens
+        return self.completion_tokens / self.prompt_tokens
 
 
 @dataclass
@@ -256,7 +256,16 @@ class BaseAttack(ABC):
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(ssl=self.config.target.verify_ssl)
-            timeout   = aiohttp.ClientTimeout(total=self.config.target.timeout)  # None = no timeout
+            # sock_connect=10: fail fast if the server won't accept a new
+            # connection (saturated / queue full).
+            # sock_read=300: detect a stream that goes completely silent —
+            # fires only if no bytes arrive for 5 min, so legitimate long
+            # reasoning responses are not affected.
+            timeout = aiohttp.ClientTimeout(
+                total=self.config.target.timeout,
+                sock_connect=10,
+                sock_read=300,
+            )
             self._session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,

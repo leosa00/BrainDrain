@@ -1,9 +1,0 @@
-{
-  "baseline_itl_ms": 21.251363587509786,
-  "baseline_ttft_s": 0.04781316919979872,
-  "baseline_kv_est": 0.0,
-  "baseline_pure_itl_ms": 21.042215511822473,
-  "target_url": "http://34.13.219.163",
-  "model": "qwen3-14b",
-  "saved_at": "2026-04-24T12:33:54.166657+00:00"
-}

@@ -1,1 +1,0 @@
-{"type": "run_meta", "timestamp": 1777551171.4758637, "timestamp_iso": "2026-04-30T12:12:51.475864+00:00", "model": "deepseek-r1-7b", "target_url": "http://35.234.166.213", "attack_type": "reasoning_bomb", "n_instances": 9, "max_tokens": 15000, "token_budget": null, "puzzle_file": "prompts/reasoningBomb_puzzles.json", "budget_tier": "256"}
