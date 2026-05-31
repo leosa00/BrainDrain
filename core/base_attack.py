@@ -5,6 +5,7 @@ base_attack.py — Abstract base class for all LLM DoS attack modules.
 from __future__ import annotations
 
 import asyncio
+import socket
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -13,6 +14,45 @@ from enum import Enum
 from typing import Any, AsyncIterator, Optional
 
 import aiohttp
+
+
+# ─────────────────────────────────────────────
+# Keepalive connector
+# ─────────────────────────────────────────────
+
+# Aggressive TCP keepalive: probe an idle connection after 30s, then every 10s,
+# and give up after 3 unanswered probes (~60s to detect a dead peer).  This is a
+# transport-layer liveness check with no assumptions about the serving stack —
+# it surfaces connections whose backend has gone away (process restart, reset,
+# network drop) even while the HTTP stream is silent: the socket errors, the
+# streaming read raises, and the dispatcher recycles the slot.  A connection
+# that is merely idle but alive (request queued or preempted on a healthy
+# server) keeps answering probes and is left untouched, so KV-heavy requests are
+# never dropped.  How far the probe reaches depends on the deployment (an L4 /
+# passthrough LB reaches the backend; an L7 proxy only proves the proxy is up).
+_KEEPALIVE_OPTS = {
+    "TCP_KEEPIDLE":  30,   # seconds idle before the first probe (Linux)
+    "TCP_KEEPINTVL": 10,   # seconds between probes
+    "TCP_KEEPCNT":   3,    # failed probes before the socket is declared dead
+}
+
+
+class KeepAliveTCPConnector(aiohttp.TCPConnector):
+    """TCPConnector that enables aggressive TCP keepalive on every socket."""
+
+    async def _wrap_create_connection(self, *args, **kwargs):
+        transport, protocol = await super()._wrap_create_connection(*args, **kwargs)
+        sock = transport.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                for name, value in _KEEPALIVE_OPTS.items():
+                    opt = getattr(socket, name, None)  # platform-dependent
+                    if opt is not None:
+                        sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+            except (OSError, AttributeError):
+                pass
+        return transport, protocol
 
 
 # ─────────────────────────────────────────────
@@ -208,6 +248,18 @@ class BaseAttack(ABC):
         self.config = config
         self._session: Optional[aiohttp.ClientSession] = None
         self._current_result: Optional[AttackResult] = None
+        # Lifecycle phase of the in-flight request, for live observability.
+        # One of: idle, connecting, awaiting_ttft, streaming, done, failed.
+        #   awaiting_ttft → connection accepted by the server but no token has
+        #   been generated yet.  A request stuck here is "dispatched but not
+        #   actually running" — the server has not admitted it to its running
+        #   batch (e.g. KV cache saturated).
+        self.phase: str = "idle"
+        # perf_counter timestamp of the most recent token (content OR reasoning).
+        # Lets an external observer detect a request that started streaming but
+        # has since gone silent — i.e. the server preempted/swapped it out
+        # (a "stalled" request, counted in neither running nor waiting).
+        self._last_token_t: Optional[float] = None
 
     # ── Identity ─────────────────────────────
 
@@ -255,16 +307,17 @@ class BaseAttack(ABC):
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            connector = aiohttp.TCPConnector(ssl=self.config.target.verify_ssl)
+            connector = KeepAliveTCPConnector(ssl=self.config.target.verify_ssl)
             # sock_connect=10: fail fast if the server won't accept a new
             # connection (saturated / queue full).
-            # sock_read=300: detect a stream that goes completely silent —
-            # fires only if no bytes arrive for 5 min, so legitimate long
-            # reasoning responses are not affected.
+            # No read timeout is set on purpose: a long but alive response (e.g.
+            # a request queued or preempted on a healthy server) must not be
+            # killed.  A genuinely dead connection is detected by TCP keepalive
+            # (see KeepAliveTCPConnector), which can't false-positive on a peer
+            # that is still answering.
             timeout = aiohttp.ClientTimeout(
                 total=self.config.target.timeout,
                 sock_connect=10,
-                sock_read=300,
             )
             self._session = aiohttp.ClientSession(
                 connector=connector,
@@ -296,7 +349,7 @@ class BaseAttack(ABC):
         session = await self._get_session()
 
         t_start = time.perf_counter()
-        t_first_token: Optional[float] = None
+        self.phase = "connecting"
 
         try:
             async with session.post(
@@ -309,7 +362,14 @@ class BaseAttack(ABC):
                     body = await response.text()
                     result.status = AttackStatus.FAILED
                     result.error  = f"HTTP {response.status}: {body[:512]}"
+                    self.phase = "failed"
                     return result
+
+                # Response headers received: the server accepted the request.
+                # For a streaming request we are now waiting for the first
+                # generated token — if the server's KV cache is saturated the
+                # request parks here, admitted on the wire but not generating.
+                self.phase = "awaiting_ttft"
 
                 if self.config.stream:
                     result = await self._consume_stream(
@@ -322,12 +382,21 @@ class BaseAttack(ABC):
                     result.latency_metrics.total_duration_s = t_end - t_start
                     result.status = AttackStatus.SUCCESS
 
+            self.phase = "done"
+
         except asyncio.TimeoutError:
+            self.phase = "done"
             result.status = AttackStatus.TIMEOUT
-            result.error  = f"Request timed out after {self.config.target.timeout}s"
+            t = self.config.target.timeout
+            result.error  = (
+                f"Request timed out after {t}s"
+                if t is not None
+                else "Request timed out (read/connect timeout)"
+            )
             result.latency_metrics.total_duration_s = time.perf_counter() - t_start
 
         except aiohttp.ClientError as exc:
+            self.phase = "failed"
             result.status = AttackStatus.FAILED
             result.error  = str(exc)
 
@@ -364,14 +433,34 @@ class BaseAttack(ABC):
                 result.metadata["_t_now"]   = t_now
                 result.metadata["_t_start"] = t_start
 
+                rt_before = result.metadata.get("_streaming_reasoning_tokens", 0)
                 delta = self.parse_stream_chunk(data_str, result)
+                rt_after = result.metadata.get("_streaming_reasoning_tokens", 0)
 
-                if delta is not None:
+                # A token of either kind (content delta OR reasoning token).
+                # Reasoning models (DeepSeek R1, QwQ) stream reasoning_content,
+                # which parse_stream_chunk counts but returns as None; keying
+                # only off `delta` would read 20k-token reasoning as idle.
+                if delta is not None or rt_after > rt_before:
+                    self._last_token_t = t_now
+                    # Flip on first token, and recover from "stalled" if the
+                    # server resumed a previously-preempted request.
+                    self.phase = "streaming"
+
+                    # Count EVERY generated token — reasoning or content — toward
+                    # TTFT and inter-token latency.  A reasoning bomb may emit its
+                    # entire output as reasoning_content (delta is None) and hit
+                    # max_tokens before any answer text, so gating these on
+                    # `delta` would leave ttft/itl/tps at zero for the runs we
+                    # care about most.
                     if t_first_token is None:
                         t_first_token = t_now
                     result.latency_metrics.inter_token_latencies.append(t_now - t_last)
-                    full_text.append(delta)
                     t_last = t_now
+
+                if delta is not None:
+                    # raw_response holds answer text only — reasoning is excluded.
+                    full_text.append(delta)
 
                 if self.config.stream_read_delay_s > 0:
                     await asyncio.sleep(self.config.stream_read_delay_s)

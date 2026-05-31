@@ -23,6 +23,7 @@ from core.base_attack import APIFormat, AttackStatus, BaseAttack, TargetConfig
 from attacks.reasoning_bomb import ReasoningBombAttack, ReasoningBombConfig, PuzzleLoader
 from attacks.think_trap import ThinkTrapAttack, ThinkTrapConfig
 from orchestration.attacker_instance import AttackerInstance, AttackerInstanceConfig
+from orchestration.dispatcher import AttackDispatcher
 from orchestration.registry import make_config_factory
 from orchestration.result_collector import ResultCollector
 from probes.itl_probes import InfraState, ITLProbes, ProbeConfig
@@ -39,7 +40,7 @@ try:
 except ImportError:
     _RICH = False
 
-console = Console() if _RICH else None
+console = Console(force_terminal=True) if _RICH else None
 
 # ─────────────────────────────────────────────
 # Logging setup
@@ -595,9 +596,6 @@ def gather_attack_params(target: TargetConfig) -> dict:
     )
     stream_read_delay_s = _ask_float("Stream read delay per chunk (seconds, 0=off)", default=0.0, min_val=0.0)
 
-    skip_probing_raw = _choose("Enable ITL probing during attack?", ["y", "n"], "y")
-    skip_probing = skip_probing_raw != "y"
-
     return {
         "attack_type":          attack_type,
         "n_instances":          n_instances,
@@ -606,7 +604,6 @@ def gather_attack_params(target: TargetConfig) -> dict:
         "launch_stagger_s":     launch_stagger_s,
         "max_tokens_spread_pct": max_tokens_spread_pct,
         "stream_read_delay_s":  stream_read_delay_s,
-        "skip_probing":         skip_probing,
         "extra":                extra,
     }
 
@@ -864,18 +861,20 @@ class StatusDisplay:
     """Lightweight live status panel (rich or plain)."""
 
     def __init__(self) -> None:
-        self._start         = time.time()
-        self._state         = InfraState.UNKNOWN
-        self._kv_est        = -1.0
-        self._itl_ms        = 0.0
-        self._ttft_s        = 0.0
-        self._requests      = 0
-        self._output_tokens = 0   # completion + reasoning tokens (used for budget)
-        self._input_tokens  = 0   # prompt tokens
-        self._budget        = None
-        self._instances: int = 0
-        self._errors        = 0
-        self._last_error    = ""
+        self._start           = time.time()
+        self._state           = InfraState.UNKNOWN
+        self._kv_est          = -1.0
+        self._itl_ms          = 0.0
+        self._ttft_s          = 0.0
+        self._requests        = 0
+        self._output_tokens   = 0   # completion + reasoning tokens (used for budget)
+        self._input_tokens    = 0   # prompt tokens
+        self._budget          = None
+        self._active_requests: int = 0   # currently in-flight HTTP connections
+        self._target_requests: int = 0   # desired concurrent count (n_instances)
+        self._phase_breakdown: dict[str, int] = {}  # in-flight requests by phase
+        self._errors          = 0
+        self._last_error      = ""
 
     def update(
         self,
@@ -888,21 +887,36 @@ class StatusDisplay:
         output_tokens: Optional[int] = None,
         input_tokens: Optional[int] = None,
         budget: Optional[int] = None,
-        instances: Optional[int] = None,
+        active_requests: Optional[int] = None,
+        target_requests: Optional[int] = None,
+        phase_breakdown: Optional[dict[str, int]] = None,
         errors: Optional[int] = None,
         last_error: Optional[str] = None,
     ) -> None:
-        if state         is not None: self._state         = state
-        if kv_est        is not None: self._kv_est        = kv_est
-        if itl_ms        is not None: self._itl_ms        = itl_ms
-        if ttft_s        is not None: self._ttft_s        = ttft_s
-        if requests      is not None: self._requests      = requests
-        if output_tokens is not None: self._output_tokens = output_tokens
-        if input_tokens  is not None: self._input_tokens  = input_tokens
-        if budget        is not None: self._budget        = budget
-        if instances     is not None: self._instances     = instances
-        if errors        is not None: self._errors        = errors
-        if last_error    is not None: self._last_error    = last_error
+        if state           is not None: self._state           = state
+        if kv_est          is not None: self._kv_est          = kv_est
+        if itl_ms          is not None: self._itl_ms          = itl_ms
+        if ttft_s          is not None: self._ttft_s          = ttft_s
+        if requests        is not None: self._requests        = requests
+        if output_tokens   is not None: self._output_tokens   = output_tokens
+        if input_tokens    is not None: self._input_tokens    = input_tokens
+        if budget          is not None: self._budget          = budget
+        if active_requests is not None: self._active_requests = active_requests
+        if target_requests is not None: self._target_requests = target_requests
+        if phase_breakdown is not None: self._phase_breakdown = phase_breakdown
+        if errors          is not None: self._errors          = errors
+        if last_error      is not None: self._last_error      = last_error
+
+    # Display order: actively-generating first, then the not-running phases.
+    _PHASE_ORDER = ["streaming", "stalled", "awaiting_ttft", "connecting", "starting", "done", "failed"]
+
+    def _phase_str(self) -> str:
+        bd = self._phase_breakdown
+        if not bd:
+            return ""
+        ordered = [p for p in self._PHASE_ORDER if bd.get(p)]
+        ordered += [p for p in bd if p not in self._PHASE_ORDER and bd.get(p)]
+        return "  ".join(f"{p}={bd[p]}" for p in ordered)
 
     def render(self) -> Any:
         elapsed = time.time() - self._start
@@ -925,9 +939,26 @@ class StatusDisplay:
             t = Table.grid(padding=(0, 2))
             t.add_column(style="dim", width=22)
             t.add_column()
-            t.add_row("Elapsed",       f"{elapsed:.0f}s")
-            t.add_row("Instances",     str(self._instances))
-            t.add_row("Requests",      str(self._requests))
+            active_str = (
+                f"{self._active_requests}/{self._target_requests}"
+                if self._target_requests else str(self._active_requests)
+            )
+            t.add_row("Elapsed",        f"{elapsed:.0f}s")
+            t.add_row("In-flight",      active_str)
+            phase_str = self._phase_str()
+            if phase_str:
+                # Highlight when connections are open but the server is giving
+                # them no tokens (dispatched-but-not-running).
+                not_running = (
+                    self._phase_breakdown.get("awaiting_ttft", 0)
+                    + self._phase_breakdown.get("connecting", 0)
+                    + self._phase_breakdown.get("stalled", 0)
+                )
+                t.add_row(
+                    "Req phases",
+                    Text(phase_str, style="yellow" if not_running else "green"),
+                )
+            t.add_row("Requests",       str(self._requests))
             t.add_row("Output tokens", out_str)
             t.add_row("Input tokens",  f"{self._input_tokens:,}")
             t.add_row("Infra state",   Text(self._state.value, style=state_color))
@@ -943,10 +974,13 @@ class StatusDisplay:
                     t.add_row("Last error", Text(short, style="red dim"))
             return Panel(t, title="[bold]BrainDrain[/bold]", border_style="#8B0000")
         else:
-            err_str = f" err={self._errors}" if self._errors else ""
+            err_str    = f" err={self._errors}" if self._errors else ""
+            active_str = f"{self._active_requests}/{self._target_requests}" if self._target_requests else str(self._active_requests)
+            phase_str  = self._phase_str()
+            phase_out  = f" [{phase_str}]" if phase_str else ""
             print(
                 f"\r  [{elapsed:.0f}s] "
-                f"inst={self._instances} reqs={self._requests} "
+                f"active={active_str}{phase_out} reqs={self._requests} "
                 f"out={out_str} in={self._input_tokens:,} "
                 f"state={self._state.value} "
                 f"kv={kv_str} itl={self._itl_ms:.1f}ms ttft={self._ttft_s:.3f}s{err_str}",
@@ -986,7 +1020,6 @@ class AttackOrchestrator:
         launch_stagger_s:     float = 0.0,
         max_tokens_spread_pct: float = 0.0,
         stream_read_delay_s:  float = 0.0,
-        skip_probing:         bool  = False,
     ) -> None:
         self.target               = target
         self.attack_type          = attack_type
@@ -997,7 +1030,6 @@ class AttackOrchestrator:
         self.launch_stagger_s     = launch_stagger_s
         self.max_tokens_spread_pct = max_tokens_spread_pct
         self.stream_read_delay_s  = stream_read_delay_s
-        self.skip_probing         = skip_probing
         self._baseline_data: dict = {}
         self._probes_csv_fh       = None
 
@@ -1008,6 +1040,7 @@ class AttackOrchestrator:
         self._probes:   Optional[ITLProbes] = None
         self._instances: list[AttackerInstance] = []
         self._tasks:    list[asyncio.Task] = []
+        self._dispatcher: Optional[AttackDispatcher] = None
 
         # Inter-request delay (adjustable via rate_limit recovery)
         self._inter_request_delay: float = 0.0
@@ -1250,6 +1283,7 @@ class AttackOrchestrator:
             )
             self._collector.record_state(state)
             self._write_probe_row(result)
+            self._write_phase_snapshot()
 
         await self._probes.monitor(
             interval_s=self.PROBE_INTERVAL_S,
@@ -1269,7 +1303,9 @@ class AttackOrchestrator:
                 output_tokens=output_tok,
                 input_tokens=input_tok,
                 budget=self.token_budget,
-                instances=len(self._instances),
+                active_requests=self._dispatcher.active_count if self._dispatcher else 0,
+                target_requests=self.n_instances,
+                phase_breakdown=self._dispatcher.phase_breakdown if self._dispatcher else {},
             )
             if _RICH and self._live:
                 self._live.update(self._display.render())
@@ -1412,19 +1448,18 @@ class AttackOrchestrator:
         ]
         self._display.update(errors=0, last_error="")
 
-        # ── Restart instances with updated config ─────────────────────
+        # ── Restart instances + dispatcher with updated config ────────
         self._instances = []
         for i in range(self.n_instances):
             self._instances.append(self._make_instance(i))
 
-        for inst in self._instances:
-            task = asyncio.create_task(
-                inst.run_loop(
-                    self._queue, self._stop,
-                    inter_request_delay_s=self._inter_request_delay,
-                )
-            )
-            self._tasks.append(task)
+        self._dispatcher = AttackDispatcher(
+            instances=self._instances,
+            result_queue=self._queue,
+            stop_event=self._stop,
+            stagger_s=self.launch_stagger_s,
+        )
+        self._tasks.append(asyncio.create_task(self._dispatcher.run()))
 
         _print(
             f"\n  [green]Restarted {self.n_instances} instances with "
@@ -1444,10 +1479,18 @@ class AttackOrchestrator:
     # ── Collector task ────────────────────────────────────────────────
 
     async def _collect(self) -> None:
-        """Drain the result queue, surface FAILED results, and trigger recovery."""
-        while not self._stop.is_set() or not self._queue.empty():
-            try:
-                result = await asyncio.wait_for(self._queue.get(), timeout=0.25)
+        """Drain the result queue, surface FAILED results, and trigger recovery.
+
+        Runs until explicitly cancelled so results queued by the dispatcher's
+        shutdown (cancelled partial results) are never dropped.
+        """
+        try:
+            while True:
+                try:
+                    result = await asyncio.wait_for(self._queue.get(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    continue
+
                 self._collector._results.append(result)
                 self._queue.task_done()
 
@@ -1459,7 +1502,6 @@ class AttackOrchestrator:
                     self._display.update(errors=n_failed, last_error=result.error)
                     self._consecutive_failures += 1
 
-                    # Only print the first occurrence of each distinct error to avoid spam
                     all_errors = [
                         r.error for r in self._collector._results
                         if r.status == AttackStatus.FAILED and r.error
@@ -1471,10 +1513,6 @@ class AttackOrchestrator:
                             f"\n  [attack error] {result.error}"
                         )
 
-                    # Trigger interactive recovery for config-level errors that
-                    # require user action. Network/transient errors are handled
-                    # by the 2 s backoff in run_loop — never pause instances for
-                    # them, because cancelling all tasks stops all requests.
                     if (
                         self._consecutive_failures >= RECOVERY_CONSECUTIVE
                         and not self._recovering
@@ -1486,8 +1524,6 @@ class AttackOrchestrator:
                             self._recovery_category = category
                             self._recovery_triggered.set()
                         else:
-                            # Transient / network error — warn and reset counter
-                            # so we don't re-evaluate on every subsequent failure.
                             _print(
                                 f"\n  [yellow]⚠ {self._consecutive_failures} consecutive failures "
                                 f"(transient — retrying): {result.error[:100]}[/yellow]"
@@ -1499,15 +1535,21 @@ class AttackOrchestrator:
                 else:
                     self._consecutive_failures = 0
 
-            except asyncio.TimeoutError:
-                continue
+        except asyncio.CancelledError:
+            # Drain any results that arrived between the last timeout and cancellation.
+            while not self._queue.empty():
+                try:
+                    result = self._queue.get_nowait()
+                    self._collector._results.append(result)
+                    self._queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
 
     # ── Main run ──────────────────────────────────────────────────────
 
     async def run(self) -> None:
         # Step 1 — baseline
-        if not self.skip_probing:
-            await self.run_baseline()
+        await self.run_baseline()
 
         # Step 2 — pre-flight (verify endpoint + payload before launching N instances)
         ok = await self.preflight_check()
@@ -1573,20 +1615,23 @@ class AttackOrchestrator:
         # Step 2 — open JSONL files before launching so every result is captured
         self._open_jsonl_files()
 
-        # Step 3 — create instances
+        # Step 3 — create instances (one per concurrent slot)
         for i in range(self.n_instances):
             self._instances.append(self._make_instance(i))
 
-        # Step 4 — launch tasks
-        for inst in self._instances:
-            task = asyncio.create_task(inst.run_loop(self._queue, self._stop))
-            self._tasks.append(task)
+        # Step 4 — launch dispatcher (replaces N independent run_loop tasks)
+        self._dispatcher = AttackDispatcher(
+            instances=self._instances,
+            result_queue=self._queue,
+            stop_event=self._stop,
+            stagger_s=self.launch_stagger_s,
+        )
+        self._tasks.append(asyncio.create_task(self._dispatcher.run()))
 
-        collect_task    = asyncio.create_task(self._collect())
-        probe_task      = asyncio.create_task(self._probe_monitor())
-        budget_task     = asyncio.create_task(self._budget_watcher())
-        watchdog_task   = asyncio.create_task(self._instance_watchdog())
-        recovery_task   = asyncio.create_task(self._error_watcher())
+        collect_task  = asyncio.create_task(self._collect())
+        probe_task    = asyncio.create_task(self._probe_monitor())
+        budget_task   = asyncio.create_task(self._budget_watcher())
+        recovery_task = asyncio.create_task(self._error_watcher())
 
         try:
             if _RICH:
@@ -1614,17 +1659,18 @@ class AttackOrchestrator:
             if _RICH and self._live:
                 self._live.stop()
 
-            # Cancel instance loops
+            # Stop dispatcher (it cancels its own in-flight connections internally).
             for task in self._tasks:
                 task.cancel()
             budget_task.cancel()
-            watchdog_task.cancel()
             probe_task.cancel()
             recovery_task.cancel()
 
-            # Drain remaining results
+            # Wait for dispatcher to finish cancelling and queue partial results.
             await asyncio.gather(*self._tasks, return_exceptions=True)
-            await collect_task
+            # Now cancel collect — it drains whatever the dispatcher just queued.
+            collect_task.cancel()
+            await asyncio.gather(collect_task, return_exceptions=True)
 
             if self._probes:
                 await self._probes.close()
@@ -1690,6 +1736,27 @@ class AttackOrchestrator:
         if self._probes_csv_fh is None:
             return
         self._probes_csv_fh.write(json.dumps(probe.to_dict()) + "\n")
+        self._probes_csv_fh.flush()
+
+    def _write_phase_snapshot(self) -> None:
+        """Append a timestamped breakdown of in-flight requests by phase.
+
+        Captures how many dispatched requests are actively streaming vs merely
+        connected-but-idle (awaiting_ttft / connecting) at each probe tick, so
+        the dispatched-but-not-running gap can be analysed after the run.
+        Written as a distinct ``type`` line alongside probe rows.
+        """
+        if self._probes_csv_fh is None or self._dispatcher is None:
+            return
+        breakdown = self._dispatcher.phase_breakdown
+        snapshot = {
+            "type":      "phase_snapshot",
+            "t":         time.time(),
+            "in_flight": self._dispatcher.active_count,
+            "target":    self.n_instances,
+            "breakdown": breakdown,
+        }
+        self._probes_csv_fh.write(json.dumps(snapshot) + "\n")
         self._probes_csv_fh.flush()
 
     def _close_jsonl_files(self) -> None:
@@ -1904,7 +1971,6 @@ def main() -> None:
         launch_stagger_s=params["launch_stagger_s"],
         max_tokens_spread_pct=params["max_tokens_spread_pct"],
         stream_read_delay_s=params["stream_read_delay_s"],
-        skip_probing=params["skip_probing"],
     )
 
     try:

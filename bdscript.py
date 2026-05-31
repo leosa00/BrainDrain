@@ -262,12 +262,6 @@ EXAMPLES
              "Backs up the server output queue, holding KV blocks allocated "
              "beyond pure generation time. Recommended range: 0.005–0.02 s.",
     )
-    pres.add_argument(
-        "--no-probe", action="store_true",
-        help="Disable ITL side-channel probing during the attack. "
-             "Also skips baseline calibration. Use when the target rate-limits "
-             "all traffic and probe requests would consume the quota.",
-    )
 
     # ── Output ────────────────────────────────────────────────────────────────
     out = p.add_argument_group("Output")
@@ -425,7 +419,6 @@ def _save_output(path: str, args: argparse.Namespace, target: TargetConfig,
             "stagger_s":      args.stagger,
             "spread_pct":     args.spread,
             "stream_delay_s": args.stream_delay,
-            "no_probe":       args.no_probe,
             "system_prompt":  args.system_prompt,
             "request_prefix": args.request_prefix,
         },
@@ -470,7 +463,6 @@ def main() -> None:
         launch_stagger_s=args.stagger,
         max_tokens_spread_pct=args.spread,
         stream_read_delay_s=args.stream_delay,
-        skip_probing=args.no_probe,
     )
 
     # Optionally disable the pre-flight check
