@@ -476,7 +476,7 @@ def _estimate_prompt_tokens(attack_type: str, extra: dict) -> int:
     return 0
 
 
-def gather_attack_params(target: TargetConfig) -> dict:
+def gather_attack_params(target: TargetConfig, suggested_instances: Optional[int] = None) -> dict:
     _print("\n[bold #8B0000]── Attack Configuration ──[/bold #8B0000]" if _RICH else "\n── Attack Configuration ──")
 
     attack_type = _choose(
@@ -485,7 +485,16 @@ def gather_attack_params(target: TargetConfig) -> dict:
         "reasoning_bomb",
     )
 
-    n_instances = _ask_int("Number of concurrent attacker instances", default=4)
+    if suggested_instances:
+        _print(
+            f"  [dim]KV calculator suggests ≥ {suggested_instances} instances to saturate the cache.[/dim]"
+            if _RICH else
+            f"  KV calculator suggests >= {suggested_instances} instances to saturate the cache."
+        )
+    n_instances = _ask_int(
+        "Number of concurrent attacker instances",
+        default=suggested_instances if suggested_instances else 4,
+    )
 
     _print("\n  [dim]Token budget: total tokens (completion + reasoning) the attack may generate.[/dim]" if _RICH
            else "\n  Token budget: total tokens (completion + reasoning) the attack may generate.")
@@ -619,8 +628,13 @@ async def _fetch_context_length_safe(target: TargetConfig) -> Optional[int]:
 # KV saturation calculator
 # ─────────────────────────────────────────────
 
-def _run_kv_calculator() -> None:
-    """Interactive wizard for the KV saturation calculator."""
+def _run_kv_calculator(target: Optional[TargetConfig] = None) -> Optional[int]:
+    """Interactive wizard for the KV saturation calculator.
+
+    Returns the estimated number of concurrent requests needed to saturate the
+    KV cache, so the caller can offer it as the default attacker-instance count.
+    Returns None if the estimate could not be computed.
+    """
     _print(
         "\n[bold #8B0000]── KV Cache Saturation Calculator ──[/bold #8B0000]"
         if _RICH else
@@ -646,9 +660,39 @@ def _run_kv_calculator() -> None:
     head_dim     = _ask_int("Head dimension (hidden_size / num_q_heads)", default=128)
     dtype_bytes  = _ask_int("KV cache dtype bytes (2=fp16/bf16, 1=fp8)", default=2)
 
+    # ── max-model-len: auto-detect from the live target if we have one ──────────
+    detected_len: Optional[int] = None
+    if target is not None:
+        _print(
+            "  [dim]Probing server to detect --max-model-len…[/dim]"
+            if _RICH else
+            "  Probing server to detect --max-model-len…"
+        )
+        detected_len = asyncio.run(_fetch_context_length_safe(target))
+        if detected_len:
+            _print(
+                f"  [green]Detected max-model-len: {detected_len:,} tokens.[/green]"
+                if _RICH else
+                f"  Detected max-model-len: {detected_len:,} tokens."
+            )
+
     _print("\n[bold]Request shape[/bold]" if _RICH else "\nRequest shape")
     prompt_tokens = _ask_int("Prompt tokens per request", default=256)
     max_tokens    = _ask_int("Max tokens per request", default=15000)
+    _print(
+        "  [dim]max-model-len: vLLM's hard ceiling on prompt+generated tokens per\n"
+        "  request. A single request can never occupy more KV than this. Enter 0\n"
+        "  for no cap.[/dim]"
+        if _RICH else
+        "  max-model-len: vLLM's hard ceiling on prompt+generated tokens per request.\n"
+        "  A single request can never occupy more KV than this. Enter 0 for no cap."
+    )
+    max_model_len_in = _ask_int(
+        "max-model-len (context window)",
+        default=detected_len if detected_len else (prompt_tokens + max_tokens),
+        min_val=0,
+    )
+    max_model_len: Optional[int] = max_model_len_in if max_model_len_in > 0 else None
 
     _print("")
     try:
@@ -663,6 +707,7 @@ def _run_kv_calculator() -> None:
             max_tokens=max_tokens,
             dtype_bytes=dtype_bytes,
             activation_overhead_gb=activation_overhead_gb,
+            max_model_len=max_model_len,
             verbose=True,
         )
         _print(
@@ -677,10 +722,12 @@ def _run_kv_calculator() -> None:
             f"  Set number of concurrent attacker instances to at least {n} "
             f"to saturate the KV cache."
         )
+        return n
     except ValueError as exc:
         _print(
             f"  [bold red]Error: {exc}[/bold red]" if _RICH else f"  Error: {exc}"
         )
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -1903,13 +1950,14 @@ def main() -> None:
     target  = gather_target_config()
 
     # Optional KV saturation calculator
+    suggested_instances: Optional[int] = None
     run_kv = _choose(
         "\nRun KV cache saturation calculator? Note requires specific GPU and model parameters",
         ["y", "n"],
         "n",
     )
     if run_kv == "y":
-        _run_kv_calculator()
+        suggested_instances = _run_kv_calculator(target)
 
     # Optional load-balancer detection — run before setting system prompt so the
     # user can see baseline routing behaviour first, then decide whether to pin
@@ -1959,7 +2007,7 @@ def main() -> None:
         import dataclasses
         target = dataclasses.replace(target, request_prefix=request_prefix_raw)
 
-    params  = gather_attack_params(target)
+    params  = gather_attack_params(target, suggested_instances=suggested_instances)
 
     orchestrator = AttackOrchestrator(
         target=target,
