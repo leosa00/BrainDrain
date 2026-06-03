@@ -1,9 +1,9 @@
 {
-  "baseline_itl_ms": 22.71061124341687,
-  "baseline_ttft_s": 0.1757210469993879,
-  "baseline_kv_est": 0.0011549520643999098,
-  "baseline_pure_itl_ms": 21.515217214073346,
-  "target_url": "http://34.7.246.177",
-  "model": "deepseek-r1-14b",
-  "saved_at": "2026-05-31T12:17:55.564114+00:00"
+  "baseline_itl_ms": 11.350323944244273,
+  "baseline_ttft_s": 0.032687929802341385,
+  "baseline_kv_est": 0.00044572704655880703,
+  "baseline_pure_itl_ms": 11.18362389847789,
+  "target_url": "http://34.6.203.221",
+  "model": "deepseek-r1-7b",
+  "saved_at": "2026-06-03T13:50:26.770778+00:00"
 }

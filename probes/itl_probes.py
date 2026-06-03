@@ -554,10 +554,25 @@ class ITLProbes:
 
     # ── Payload construction ──────────────────────────────────────────────────
 
-    def _build_payload(self, prompt: str, max_tokens: int, stream: bool = True) -> dict:
+    def _build_payload(
+        self,
+        prompt:               str,
+        max_tokens:           int,
+        stream:               bool = True,
+        include_user_context: bool = True,
+    ) -> dict:
+        """
+        Build a probe request payload.
+
+        When include_user_context is False, the user-configured system_prompt and
+        request_prefix are omitted. Baseline calibration uses this so that idle
+        probes do not seed the server's prefix cache (vLLM APC) or pin prefix-aware
+        routing with the attack's prefix before the attack begins — which would
+        otherwise contaminate the cold-start baseline.
+        """
         fmt    = self.config.target.api_format
-        sp     = self.config.target.system_prompt
-        prefix = self.config.target.request_prefix
+        sp     = self.config.target.system_prompt  if include_user_context else ""
+        prefix = self.config.target.request_prefix if include_user_context else ""
         prompt = f"{prefix}{prompt}" if prefix else prompt
 
         # Vertex AI uses a completely different schema
@@ -656,12 +671,16 @@ class ITLProbes:
 
     async def _stream_probe(
         self,
-        prompt:     str,
-        max_tokens: int,
-        probe_type: str = "single",
+        prompt:               str,
+        max_tokens:           int,
+        probe_type:           str  = "single",
+        include_user_context: bool = True,
     ) -> ProbeResult:
         result  = ProbeResult(probe_type=probe_type)
-        payload = self._build_payload(prompt, max_tokens, stream=True)
+        payload = self._build_payload(
+            prompt, max_tokens, stream=True,
+            include_user_context=include_user_context,
+        )
         session = await self._get_session()
         t_start = time.perf_counter()
         t_last  = t_start
@@ -776,13 +795,16 @@ class ITLProbes:
         """
         n = n_samples or self.config.baseline_window
 
+        # Strip the user system_prompt/request_prefix from every calibration
+        # probe so idle measurements don't seed the server's prefix cache or pin
+        # prefix-aware routing with the attack's prefix before the attack starts.
         for _ in range(warm_up):
-            await self.single_probe()
+            await self.single_probe(include_user_context=False)
             await asyncio.sleep(inter_delay_s)
 
         samples: List[ProbeResult] = []
         for _ in range(n):
-            r = await self.single_probe()
+            r = await self.single_probe(include_user_context=False)
             if r.success:
                 samples.append(r)
             await asyncio.sleep(inter_delay_s)
@@ -821,7 +843,7 @@ class ITLProbes:
         # idle → 0.0 and fully saturated → 1.0.
         kv_raw_samples: List[float] = []
         for _ in range(self.config.baseline_kv_n):
-            r = await self.single_probe()
+            r = await self.single_probe(include_user_context=False)
             if r.success and r.kv_usage_est >= 0:
                 kv_raw_samples.append(r.kv_usage_est)
             await asyncio.sleep(inter_delay_s)
@@ -859,13 +881,22 @@ class ITLProbes:
 
     async def single_probe(
         self,
-        prompt:     Optional[str] = None,
-        max_tokens: Optional[int] = None,
+        prompt:               Optional[str] = None,
+        max_tokens:           Optional[int] = None,
+        include_user_context: bool          = True,
     ) -> ProbeResult:
-        """One-shot streaming probe. Measures ITL and TTFT."""
+        """One-shot streaming probe. Measures ITL and TTFT.
+
+        include_user_context=False omits the user system_prompt/request_prefix so
+        the probe does not pollute the server's prefix cache (used by baseline
+        calibration).
+        """
         p = prompt     or self._PROMPTS["fixed_50"]
         t = max_tokens or self.config.max_probe_tokens
-        result = await self._stream_probe(p, t, probe_type="single")
+        result = await self._stream_probe(
+            p, t, probe_type="single",
+            include_user_context=include_user_context,
+        )
         if result.success:
             result.kv_usage_est = self._kv_estimate(
                 [v * 1000.0 for v in result.itl_values]
