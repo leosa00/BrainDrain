@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -35,12 +36,77 @@ try:
     from rich.live import Live
     from rich.panel import Panel
     from rich.text import Text
+    from rich.theme import Theme
     from rich import box
     _RICH = True
 except ImportError:
     _RICH = False
 
-console = Console(force_terminal=True) if _RICH else None
+# ─────────────────────────────────────────────
+# Colour theme — readable on light AND dark terminal backgrounds
+# ─────────────────────────────────────────────
+# All terminal colours are referenced through semantic style names (head,
+# accent, hint, warn, ok, err) instead of hardcoded colours. The concrete
+# colours are picked from one of three palettes depending on the terminal
+# background so nothing washes out:
+#   - "auto"  : mid-tone colours that stay legible on any background (default)
+#   - "light" : darker, higher-contrast colours for light backgrounds
+#   - "dark"  : brighter colours for dark backgrounds
+# Override detection with the BRAINDRAIN_THEME=light|dark|auto env var.
+
+_PALETTES = {
+    # Universal mid-tones: legible on both light and dark backgrounds.
+    "auto": {
+        "head":   "bold #d70000",
+        "accent": "#d70000",
+        "hint":   "#808080",
+        "warn":   "#d78700",
+        "ok":     "#2fa02f",
+        "err":    "bold #e03030",
+    },
+    # High contrast on light backgrounds (darker tones).
+    "light": {
+        "head":   "bold #8b0000",
+        "accent": "#8b0000",
+        "hint":   "#595959",
+        "warn":   "#9a6000",
+        "ok":     "#006d00",
+        "err":    "bold #b00000",
+    },
+    # High contrast on dark backgrounds (brighter tones).
+    "dark": {
+        "head":   "bold #ff5555",
+        "accent": "#ff5555",
+        "hint":   "#9e9e9e",
+        "warn":   "#ffd000",
+        "ok":     "#33d17a",
+        "err":    "bold #ff5555",
+    },
+}
+
+
+def _detect_theme() -> str:
+    """Pick a palette name from BRAINDRAIN_THEME or the COLORFGBG env var."""
+    override = os.environ.get("BRAINDRAIN_THEME", "").strip().lower()
+    if override in _PALETTES:
+        return override
+    # Many terminals export COLORFGBG as "fg;bg" (or "fg;;bg"); the trailing
+    # field is the background colour index. 7 (light grey) and 15 (white) are
+    # light backgrounds; everything else we treat as dark.
+    cfb = os.environ.get("COLORFGBG", "")
+    if cfb:
+        try:
+            bg = int(cfb.split(";")[-1])
+            return "light" if bg in (7, 15) else "dark"
+        except ValueError:
+            pass
+    return "auto"
+
+
+console = (
+    Console(force_terminal=True, theme=Theme(_PALETTES[_detect_theme()]))
+    if _RICH else None
+)
 
 # ─────────────────────────────────────────────
 # Logging setup
@@ -243,13 +309,13 @@ async def try_fetch_context_length(target: TargetConfig) -> Optional[int]:
                     if m:
                         return int(m.group(1))
                 _print(
-                    "  [yellow]No context length found in error body — enter manually.[/yellow]"
+                    "  [warn]No context length found in error body — enter manually.[/warn]"
                     if _RICH else
                     "  No context length found in error body — enter manually."
                 )
     except Exception as exc:
         _print(
-            f"  [yellow]Probe request failed: {exc}[/yellow]"
+            f"  [warn]Probe request failed: {exc}[/warn]"
             if _RICH else
             f"  Probe request failed: {exc}"
         )
@@ -262,7 +328,7 @@ async def try_fetch_context_length(target: TargetConfig) -> Optional[int]:
 # ─────────────────────────────────────────────
 
 def gather_target_config() -> TargetConfig:
-    _print("\n[bold #8B0000]── Target Configuration ──[/bold #8B0000]" if _RICH else "\n── Target Configuration ──")
+    _print("\n[head]── Target Configuration ──[/head]" if _RICH else "\n── Target Configuration ──")
 
     fmt_str = _choose(
         "API format",
@@ -283,13 +349,13 @@ def gather_target_config() -> TargetConfig:
 
     if api_format == APIFormat.VERTEX:
         _print(
-            "  [dim]Vertex AI (Google models): enter the full model path, e.g.\n"
+            "  [hint]Vertex AI (Google models): enter the full model path, e.g.\n"
             "  https://LOCATION-aiplatform.googleapis.com/v1/projects/PROJECT_ID/"
             "locations/LOCATION/publishers/google/models/MODEL\n"
             "  Example: https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/"
             "locations/us-central1/publishers/google/models/gemini-2.5-pro\n"
             "  The model name is extracted from the URL automatically.\n"
-            "  Use an OAuth2 access token (gcloud auth print-access-token) as the API key.[/dim]"
+            "  Use an OAuth2 access token (gcloud auth print-access-token) as the API key.[/hint]"
             if _RICH else
             "  Vertex AI (Google models): enter the full model path, e.g.\n"
             "  https://LOCATION-aiplatform.googleapis.com/v1/projects/PROJECT_ID/"
@@ -356,7 +422,7 @@ def _gather_custom_target() -> TargetConfig:
     "stream": true into the body. Everything else is sent exactly as provided.
     """
     _print(
-        "  [dim]Custom mode: paste a complete request descriptor as JSON.\n"
+        "  [hint]Custom mode: paste a complete request descriptor as JSON.\n"
         "  Format:\n"
         '    {\n'
         '      "url": "https://...",\n'
@@ -365,7 +431,7 @@ def _gather_custom_target() -> TargetConfig:
         '    }\n'
         '  Replace the message content field with [bold]"__PROMPT__"[/bold] — the tool injects the\n'
         '  attack prompt there. Everything else is sent exactly as you write it.\n'
-        "  Paste the JSON, then press Enter on a blank line to finish.[/dim]"
+        "  Paste the JSON, then press Enter on a blank line to finish.[/hint]"
         if _RICH else
         "  Custom mode: paste a complete request descriptor as JSON.\n"
         "  Format:\n"
@@ -393,7 +459,7 @@ def _gather_custom_target() -> TargetConfig:
         descriptor = json.loads(raw_json)
     except json.JSONDecodeError as exc:
         _print(
-            f"  [bold red]Invalid JSON: {exc}[/bold red]" if _RICH
+            f"  [err]Invalid JSON: {exc}[/err]" if _RICH
             else f"  Invalid JSON: {exc}"
         )
         descriptor = {}
@@ -421,7 +487,7 @@ def _gather_custom_target() -> TargetConfig:
     body_template = descriptor.get("body")
 
     if not endpoint_url:
-        _print("  [yellow]Warning: no 'url' found in descriptor.[/yellow]" if _RICH
+        _print("  [warn]Warning: no 'url' found in descriptor.[/warn]" if _RICH
                else "  Warning: no 'url' found in descriptor.")
 
     return TargetConfig(
@@ -477,7 +543,7 @@ def _estimate_prompt_tokens(attack_type: str, extra: dict) -> int:
 
 
 def gather_attack_params(target: TargetConfig) -> dict:
-    _print("\n[bold #8B0000]── Attack Configuration ──[/bold #8B0000]" if _RICH else "\n── Attack Configuration ──")
+    _print("\n[head]── Attack Configuration ──[/head]" if _RICH else "\n── Attack Configuration ──")
 
     attack_type = _choose(
         "Attack type",
@@ -487,7 +553,7 @@ def gather_attack_params(target: TargetConfig) -> dict:
 
     n_instances = _ask_int("Number of concurrent attacker instances", default=4)
 
-    _print("\n  [dim]Token budget: total tokens (completion + reasoning) the attack may generate.[/dim]" if _RICH
+    _print("\n  [hint]Token budget: total tokens (completion + reasoning) the attack may generate.[/hint]" if _RICH
            else "\n  Token budget: total tokens (completion + reasoning) the attack may generate.")
     budget_raw = _ask("Token budget (leave blank for unlimited)")
     token_budget: Optional[int] = None
@@ -518,16 +584,16 @@ def gather_attack_params(target: TargetConfig) -> dict:
     else:
         estimated_prompt_tokens = _estimate_prompt_tokens(attack_type, extra)
 
-    _print("  [dim]Probing server to detect max context length…[/dim]" if _RICH
+    _print("  [hint]Probing server to detect max context length…[/hint]" if _RICH
            else "  Probing server to detect max context length…")
     detected = asyncio.run(_fetch_context_length_safe(target))
     if detected:
         usable = max(detected - estimated_prompt_tokens - 64, 1024)
         if estimated_prompt_tokens > 0:
             _print(
-                f"  [green]Detected context length: {detected:,} tokens  "
+                f"  [ok]Detected context length: {detected:,} tokens  "
                 f"(prompt ≈ {estimated_prompt_tokens:,} tokens → "
-                f"max_completion_tokens default: {usable:,})[/green]"
+                f"max_completion_tokens default: {usable:,})[/ok]"
                 if _RICH else
                 f"  Detected context length: {detected:,} tokens  "
                 f"(prompt ≈ {estimated_prompt_tokens:,} tokens → "
@@ -535,7 +601,7 @@ def gather_attack_params(target: TargetConfig) -> dict:
             )
         else:
             _print(
-                f"  [green]Detected max context length: {detected:,} tokens.[/green]"
+                f"  [ok]Detected max context length: {detected:,} tokens.[/ok]"
                 if _RICH else
                 f"  Detected max context length: {detected:,} tokens."
             )
@@ -543,7 +609,7 @@ def gather_attack_params(target: TargetConfig) -> dict:
         default_max = usable
     else:
         _print(
-            "  [yellow]Could not detect context length — defaulting to 16384.[/yellow]"
+            "  [warn]Could not detect context length — defaulting to 16384.[/warn]"
             if _RICH else
             "  Could not detect context length — defaulting to 16384."
         )
@@ -556,7 +622,7 @@ def gather_attack_params(target: TargetConfig) -> dict:
 
     # ── Sustained pressure options ────────────────────────────────────────────
     _print(
-        "\n[bold #8B0000]── Sustained Pressure Options ──[/bold #8B0000]\n"
+        "\n[head]── Sustained Pressure Options ──[/head]\n"
         "  These settings prevent simultaneous request completion (wave pattern)\n"
         "  which would briefly free the KV cache and let the scheduler recover.\n"
         if _RICH else
@@ -566,8 +632,8 @@ def gather_attack_params(target: TargetConfig) -> dict:
     )
 
     _print(
-        "  [dim]Launch stagger: delay between starting each instance so they\n"
-        "  complete at different times. Rule of thumb: set to est_request_duration / n_instances.[/dim]"
+        "  [hint]Launch stagger: delay between starting each instance so they\n"
+        "  complete at different times. Rule of thumb: set to est_request_duration / n_instances.[/hint]"
         if _RICH else
         "  Launch stagger: delay between starting each instance so they\n"
         "  complete at different times. Rule of thumb: set to est_request_duration / n_instances."
@@ -575,9 +641,9 @@ def gather_attack_params(target: TargetConfig) -> dict:
     launch_stagger_s = _ask_float("Launch stagger between instances (seconds, 0=off)", default=0.0)
 
     _print(
-        "  [dim]Max-token spread: assign each instance a different max_tokens\n"
+        "  [hint]Max-token spread: assign each instance a different max_tokens\n"
         "  (linearly distributed across ±spread%). Prevents synchronised completions\n"
-        "  even after the initial stagger window has passed.[/dim]"
+        "  even after the initial stagger window has passed.[/hint]"
         if _RICH else
         "  Max-token spread: assign each instance a different max_tokens\n"
         "  (linearly distributed across ±spread%). Prevents synchronised completions\n"
@@ -586,9 +652,9 @@ def gather_attack_params(target: TargetConfig) -> dict:
     max_tokens_spread_pct = _ask_float("Max-token spread (%, 0=off, e.g. 25)", default=0.0, min_val=0.0)
 
     _print(
-        "  [dim]Stream read delay: sleep between reading each streaming chunk.\n"
+        "  [hint]Stream read delay: sleep between reading each streaming chunk.\n"
         "  Backs up the server output queue, extending effective KV block\n"
-        "  occupancy beyond pure generation time. 0.005–0.02 s is a good range.[/dim]"
+        "  occupancy beyond pure generation time. 0.005–0.02 s is a good range.[/hint]"
         if _RICH else
         "  Stream read delay: sleep between reading each streaming chunk.\n"
         "  Backs up the server output queue, extending effective KV block\n"
@@ -622,7 +688,7 @@ async def _fetch_context_length_safe(target: TargetConfig) -> Optional[int]:
 def _run_kv_calculator() -> None:
     """Interactive wizard for the KV saturation calculator."""
     _print(
-        "\n[bold #8B0000]── KV Cache Saturation Calculator ──[/bold #8B0000]"
+        "\n[head]── KV Cache Saturation Calculator ──[/head]"
         if _RICH else
         "\n── KV Cache Saturation Calculator ──"
     )
@@ -666,20 +732,20 @@ def _run_kv_calculator() -> None:
             verbose=True,
         )
         _print(
-            f"\n  [bold green]Requests to fill KV cache: {n}[/bold green]"
+            f"\n  [ok]Requests to fill KV cache: {n}[/ok]"
             if _RICH else
             f"\n  Requests to fill KV cache: {n}"
         )
         _print(
-            f"  [dim]Set number of concurrent attacker instances to at least [bold]{n}[/bold] "
-            f"to saturate the KV cache.[/dim]"
+            f"  [hint]Set number of concurrent attacker instances to at least [bold]{n}[/bold] "
+            f"to saturate the KV cache.[/hint]"
             if _RICH else
             f"  Set number of concurrent attacker instances to at least {n} "
             f"to saturate the KV cache."
         )
     except ValueError as exc:
         _print(
-            f"  [bold red]Error: {exc}[/bold red]" if _RICH else f"  Error: {exc}"
+            f"  [err]Error: {exc}[/err]" if _RICH else f"  Error: {exc}"
         )
 
 
@@ -690,7 +756,7 @@ def _run_kv_calculator() -> None:
 async def _run_lb_test(target: TargetConfig) -> None:
     """Run a load-balancer detection test and print results."""
     _print(
-        "\n[bold #8B0000]── Load Balancer Detection ──[/bold #8B0000]"
+        "\n[head]── Load Balancer Detection ──[/head]"
         if _RICH else
         "\n── Load Balancer Detection ──"
     )
@@ -718,7 +784,7 @@ async def _run_lb_test(target: TargetConfig) -> None:
     )
     probes = ITLProbes(cfg)
 
-    _print("  Running warm-up requests…" if not _RICH else "  [dim]Running warm-up requests…[/dim]")
+    _print("  Running warm-up requests…" if not _RICH else "  [hint]Running warm-up requests…[/hint]")
     try:
         result = await probes.load_balancer_probe(
             n_pairs=n_pairs,
@@ -731,7 +797,7 @@ async def _run_lb_test(target: TargetConfig) -> None:
 
     if not result["success"]:
         _print(
-            f"  [bold red]LB test failed: {result.get('error')}[/bold red]"
+            f"  [err]LB test failed: {result.get('error')}[/err]"
             if _RICH else
             f"  LB test failed: {result.get('error')}"
         )
@@ -740,12 +806,12 @@ async def _run_lb_test(target: TargetConfig) -> None:
     errors = result.get("errors", [])
     if errors:
         _print(
-            f"  [yellow]Warning: {len(errors)} probe pair(s) failed and were skipped:[/yellow]"
+            f"  [warn]Warning: {len(errors)} probe pair(s) failed and were skipped:[/warn]"
             if _RICH else
             f"  Warning: {len(errors)} probe pair(s) failed and were skipped:"
         )
         for e in errors:
-            _print(f"    [dim]{e}[/dim]" if _RICH else f"    {e}")
+            _print(f"    [hint]{e}[/hint]" if _RICH else f"    {e}")
 
     hit_rate   = result["cache_hit_rate"]
     same       = result["same_backend"]
@@ -753,9 +819,9 @@ async def _run_lb_test(target: TargetConfig) -> None:
     verdict    = result["verdict"]
     med_ratio  = result["median_ttft_ratio"]
 
-    verdict_style = "green" if same else "red"
+    verdict_style = "ok" if same else "err"
     _print(
-        f"\n  [bold {verdict_style}]Verdict: {verdict}[/bold {verdict_style}]\n"
+        f"\n  [{verdict_style}]Verdict: {verdict}[/{verdict_style}]\n"
         f"  Cache hit rate    : {hit_rate:.1%}  ({result['n_cache_hits']}/{result['n_pairs']} pairs)\n"
         f"  Median TTFT ratio : {med_ratio:.3f}×  (warm/cold — lower = stronger cache hit)\n"
         f"  Confidence        : {confidence}\n"
@@ -768,9 +834,9 @@ async def _run_lb_test(target: TargetConfig) -> None:
 
     if same:
         _print(
-            "  [bold green]Tip: set a system prompt to pin all attack and probe requests\n"
+            "  [ok]Tip: set a system prompt to pin all attack and probe requests\n"
             "  to the same KV-cache slot via prefix-aware routing — this maximises\n"
-            "  cache pressure on a single backend.[/bold green]"
+            "  cache pressure on a single backend.[/ok]"
             if _RICH else
             "  Tip: set a system prompt to pin all attack and probe requests\n"
             "  to the same KV-cache slot via prefix-aware routing — this maximises\n"
@@ -779,14 +845,14 @@ async def _run_lb_test(target: TargetConfig) -> None:
 
     if _RICH:
         t = Table.grid(padding=(0, 2))
-        t.add_column(style="dim", width=6)
+        t.add_column(style="hint", width=6)
         t.add_column(justify="right", width=11)
         t.add_column(justify="right", width=11)
         t.add_column(justify="right", width=7)
         t.add_column(justify="center", width=5)
-        console.print("  pair  cold_ttft   warm_ttft   ratio  hit", style="dim")
+        console.print("  pair  cold_ttft   warm_ttft   ratio  hit", style="hint")
         for p in result["pairs"]:
-            hit_text = Text("yes", style="green") if p["cache_hit"] else Text("no", style="red")
+            hit_text = Text("yes", style="ok") if p["cache_hit"] else Text("no", style="err")
             t.add_row(
                 str(p["pair"]),
                 f"{p['ttft_cold_s']:.4f}s",
@@ -937,7 +1003,7 @@ class StatusDisplay:
 
         if _RICH:
             t = Table.grid(padding=(0, 2))
-            t.add_column(style="dim", width=22)
+            t.add_column(style="hint", width=22)
             t.add_column()
             active_str = (
                 f"{self._active_requests}/{self._target_requests}"
@@ -956,7 +1022,7 @@ class StatusDisplay:
                 )
                 t.add_row(
                     "Req phases",
-                    Text(phase_str, style="yellow" if not_running else "green"),
+                    Text(phase_str, style="warn" if not_running else "ok"),
                 )
             t.add_row("Requests",       str(self._requests))
             t.add_row("Output tokens", out_str)
@@ -966,13 +1032,13 @@ class StatusDisplay:
             t.add_row("Mean ITL",    f"{self._itl_ms:.1f} ms")
             t.add_row("TTFT",        f"{self._ttft_s:.3f} s")
             if self._errors:
-                err_text = Text(f"{self._errors} failed", style="red")
+                err_text = Text(f"{self._errors} failed", style="err")
                 t.add_row("Errors", err_text)
                 if self._last_error:
                     # Truncate to fit panel width
                     short = self._last_error[:60] + ("…" if len(self._last_error) > 60 else "")
-                    t.add_row("Last error", Text(short, style="red dim"))
-            return Panel(t, title="[bold]BrainDrain[/bold]", border_style="#8B0000")
+                    t.add_row("Last error", Text(short, style="err"))
+            return Panel(t, title="[bold]BrainDrain[/bold]", border_style="accent")
         else:
             err_str    = f" err={self._errors}" if self._errors else ""
             active_str = f"{self._active_requests}/{self._target_requests}" if self._target_requests else str(self._active_requests)
@@ -1135,7 +1201,7 @@ class AttackOrchestrator:
         Prints the error so the user can act before launching N instances.
         """
         _print(
-            "  [dim]Pre-flight: firing one test request…[/dim]"
+            "  [hint]Pre-flight: firing one test request…[/hint]"
             if _RICH else
             "  Pre-flight: firing one test request…"
         )
@@ -1151,7 +1217,7 @@ class AttackOrchestrator:
             attack = cls(factory(), **extra_kw)
         except Exception as exc:
             _print(
-                f"  [bold red]Pre-flight FAILED (init): {exc}[/bold red]"
+                f"  [err]Pre-flight FAILED (init): {exc}[/err]"
                 if _RICH else
                 f"  Pre-flight FAILED (init): {exc}"
             )
@@ -1161,7 +1227,7 @@ class AttackOrchestrator:
             result = await attack.run()
         except Exception as exc:
             _print(
-                f"  [bold red]Pre-flight FAILED (request): {exc}[/bold red]"
+                f"  [err]Pre-flight FAILED (request): {exc}[/err]"
                 if _RICH else
                 f"  Pre-flight FAILED (request): {exc}"
             )
@@ -1171,16 +1237,16 @@ class AttackOrchestrator:
 
         if result.status == AttackStatus.FAILED:
             _print(
-                f"  [bold red]Pre-flight FAILED: {result.error}[/bold red]"
+                f"  [err]Pre-flight FAILED: {result.error}[/err]"
                 if _RICH else
                 f"  Pre-flight FAILED: {result.error}"
             )
             return False
 
         _print(
-            f"  [green]Pre-flight OK — "
+            f"  [ok]Pre-flight OK — "
             f"{result.token_metrics.completion_tokens} tokens in "
-            f"{result.latency_metrics.total_duration_s:.1f}s[/green]"
+            f"{result.latency_metrics.total_duration_s:.1f}s[/ok]"
             if _RICH else
             f"  Pre-flight OK — "
             f"{result.token_metrics.completion_tokens} tokens in "
@@ -1191,7 +1257,7 @@ class AttackOrchestrator:
     # ── Baseline calibration ──────────────────────────────────────────
 
     async def run_baseline(self) -> None:
-        _print("\n[bold #8B0000]── Baseline Calibration ──[/bold #8B0000]" if _RICH
+        _print("\n[head]── Baseline Calibration ──[/head]" if _RICH
                else "\n── Baseline Calibration ──")
         _print("  Running 5 probe requests against idle server…")
 
@@ -1207,8 +1273,8 @@ class AttackOrchestrator:
         kv   = result.get("baseline_kv_est",  0.0)
         self._baseline_data = {"itl_ms": itl, "ttft_s": ttft, "kv_est": kv}
         _print(
-            f"  [green]Baseline: ITL={itl:.2f} ms  TTFT={ttft:.4f} s  "
-            f"KV(idle)={kv:.4f}[/green]"
+            f"  [ok]Baseline: ITL={itl:.2f} ms  TTFT={ttft:.4f} s  "
+            f"KV(idle)={kv:.4f}[/ok]"
             if _RICH else
             f"  Baseline: ITL={itl:.2f} ms  TTFT={ttft:.4f} s  KV(idle)={kv:.4f}"
         )
@@ -1229,8 +1295,8 @@ class AttackOrchestrator:
             ) or 0
             if generated >= self.token_budget:
                 _print(
-                    f"\n  [bold yellow]Token budget exhausted "
-                    f"({generated:,} / {self.token_budget:,}). Stopping.[/bold yellow]"
+                    f"\n  [warn]Token budget exhausted "
+                    f"({generated:,} / {self.token_budget:,}). Stopping.[/warn]"
                     if _RICH else
                     f"\n  Token budget exhausted ({generated:,} / {self.token_budget:,}). Stopping."
                 )
@@ -1253,7 +1319,7 @@ class AttackOrchestrator:
                     exc = task.exception() if not task.cancelled() else None
                     if exc:
                         _print(
-                            f"\n  [yellow]Instance task {i} died: {exc}. Restarting.[/yellow]"
+                            f"\n  [warn]Instance task {i} died: {exc}. Restarting.[/warn]"
                             if _RICH else
                             f"\n  Instance task {i} died: {exc}. Restarting."
                         )
@@ -1347,15 +1413,15 @@ class AttackOrchestrator:
 
         _print("\n")
         if _RICH:
-            console.rule("[bold red]Attack Paused — Recoverable Error[/bold red]")
+            console.rule("[err]Attack Paused — Recoverable Error[/err]")
         else:
             print("=" * 60)
             print("  Attack Paused — Recoverable Error")
             print("=" * 60)
 
         _print(
-            f"\n  [bold red]Error category :[/bold red] {category}\n"
-            f"  [dim]Sample error   : {sample_error[:120]}[/dim]\n"
+            f"\n  [err]Error category :[/err] {category}\n"
+            f"  [hint]Sample error   : {sample_error[:120]}[/hint]\n"
             if _RICH else
             f"\n  Error category : {category}\n"
             f"  Sample error   : {sample_error[:120]}\n"
@@ -1391,7 +1457,7 @@ class AttackOrchestrator:
                 if new_val > 0:
                     self.max_tokens = new_val
                     _print(
-                        f"  [green]max_tokens updated → {self.max_tokens:,}[/green]"
+                        f"  [ok]max_tokens updated → {self.max_tokens:,}[/ok]"
                         if _RICH else
                         f"  max_tokens updated → {self.max_tokens:,}"
                     )
@@ -1404,7 +1470,7 @@ class AttackOrchestrator:
                 self.target = self.target.__class__(
                     **{**self.target.__dict__, "api_key": raw}
                 )
-                _print("  [green]API key updated.[/green]" if _RICH else "  API key updated.")
+                _print("  [ok]API key updated.[/ok]" if _RICH else "  API key updated.")
 
         elif category == "model_not_found":
             raw = await _ask_async(f"New {label}", self.target.model)
@@ -1413,7 +1479,7 @@ class AttackOrchestrator:
                 import dataclasses
                 self.target = dataclasses.replace(self.target, model=raw)
                 _print(
-                    f"  [green]Model updated → {self.target.model}[/green]"
+                    f"  [ok]Model updated → {self.target.model}[/ok]"
                     if _RICH else
                     f"  Model updated → {self.target.model}"
                 )
@@ -1425,7 +1491,7 @@ class AttackOrchestrator:
                 # Propagate to new instances via a stored attribute
                 self._inter_request_delay = max(0.0, delay)
                 _print(
-                    f"  [green]Inter-request delay → {self._inter_request_delay:.1f}s[/green]"
+                    f"  [ok]Inter-request delay → {self._inter_request_delay:.1f}s[/ok]"
                     if _RICH else
                     f"  Inter-request delay → {self._inter_request_delay:.1f}s"
                 )
@@ -1435,7 +1501,7 @@ class AttackOrchestrator:
         # ── Ask whether to continue ───────────────────────────────────
         action = await _ask_async("Continue attack? (y/n)", "y")
         if action.lower() not in ("y", "yes"):
-            _print("  Stopping." if not _RICH else "  [yellow]Stopping.[/yellow]")
+            _print("  Stopping." if not _RICH else "  [warn]Stopping.[/warn]")
             self._stop.set()
             self._recovering = False
             return
@@ -1462,8 +1528,8 @@ class AttackOrchestrator:
         self._tasks.append(asyncio.create_task(self._dispatcher.run()))
 
         _print(
-            f"\n  [green]Restarted {self.n_instances} instances with "
-            f"max_tokens={self.max_tokens:,}.[/green]\n"
+            f"\n  [ok]Restarted {self.n_instances} instances with "
+            f"max_tokens={self.max_tokens:,}.[/ok]\n"
             if _RICH else
             f"\n  Restarted {self.n_instances} instances with "
             f"max_tokens={self.max_tokens:,}.\n"
@@ -1508,7 +1574,7 @@ class AttackOrchestrator:
                     ]
                     if all_errors.count(result.error) == 1:
                         _print(
-                            f"\n  [red][attack error][/red] {result.error}"
+                            f"\n  [err][attack error][/err] {result.error}"
                             if _RICH else
                             f"\n  [attack error] {result.error}"
                         )
@@ -1525,8 +1591,8 @@ class AttackOrchestrator:
                             self._recovery_triggered.set()
                         else:
                             _print(
-                                f"\n  [yellow]⚠ {self._consecutive_failures} consecutive failures "
-                                f"(transient — retrying): {result.error[:100]}[/yellow]"
+                                f"\n  [warn]⚠ {self._consecutive_failures} consecutive failures "
+                                f"(transient — retrying): {result.error[:100]}[/warn]"
                                 if _RICH else
                                 f"\n  ⚠ {self._consecutive_failures} consecutive failures "
                                 f"(transient — retrying): {result.error[:100]}"
@@ -1555,7 +1621,7 @@ class AttackOrchestrator:
         ok = await self.preflight_check()
         if not ok:
             _print(
-                "\n  [bold red]Pre-flight failed. Fix the error above then retry.[/bold red]"
+                "\n  [err]Pre-flight failed. Fix the error above then retry.[/err]"
                 if _RICH else
                 "\n  Pre-flight failed. Fix the error above then retry."
             )
@@ -1587,7 +1653,7 @@ class AttackOrchestrator:
             print("\033[2J\033[H", end="", flush=True)
 
         _print(
-            f"\n[bold #8B0000]── Launching Attack ──[/bold #8B0000]\n"
+            f"\n[head]── Launching Attack ──[/head]\n"
             f"  Type            : {self.attack_type}\n"
             f"{extra_lines}"
             f"  Instances       : {self.n_instances}\n"
@@ -1647,7 +1713,7 @@ class AttackOrchestrator:
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             _print(
-                "\n\n  [bold yellow]Interrupted by user.[/bold yellow]"
+                "\n\n  [warn]Interrupted by user.[/warn]"
                 if _RICH else
                 "\n\n  Interrupted by user."
             )
@@ -1727,7 +1793,7 @@ class AttackOrchestrator:
         self._probes_csv_fh.flush()
 
         _print(
-            f"\n  [dim]Saving to results/{tag}_probes.jsonl[/dim]"
+            f"\n  [hint]Saving to results/{tag}_probes.jsonl[/hint]"
             if _RICH else
             f"\n  Saving to results/{tag}_probes.jsonl"
         )
@@ -1835,19 +1901,19 @@ class AttackOrchestrator:
         with out.open("w", encoding="utf-8") as fh:
             json.dump(doc, fh, indent=2)
         _print(
-            f"  [green]Summary saved → {out}[/green]" if _RICH
+            f"  [ok]Summary saved → {out}[/ok]" if _RICH
             else f"  Summary saved → {out}"
         )
 
 
     def _print_summary(self, result: Any) -> None:
         _print(
-            "\n[bold #8B0000]── Attack Summary ──[/bold #8B0000]" if _RICH
+            "\n[head]── Attack Summary ──[/head]" if _RICH
             else "\n── Attack Summary ──"
         )
         if _RICH:
-            t = Table(box=box.SIMPLE, show_header=True, header_style="bold #8B0000")
-            t.add_column("Metric", style="dim")
+            t = Table(box=box.SIMPLE, show_header=True, header_style="head")
+            t.add_column("Metric", style="hint")
             t.add_column("Value", justify="right")
             t.add_row("Wall clock",        f"{result.wall_clock_s:.1f}s")
             t.add_row("Total requests",    str(result.total_requests))
@@ -1889,10 +1955,10 @@ def main() -> None:
     _setup_logging()
 
     if _RICH:
-        console.print(_BANNER, style="bold #8B0000", highlight=False)
+        console.print(_BANNER, style="head", highlight=False)
         console.print(
             "       LLM Denial-of-Service Research Framework\n",
-            style="dim",
+            style="hint",
             justify="center",
         )
     else:
@@ -1923,7 +1989,7 @@ def main() -> None:
         try:
             asyncio.run(_run_lb_test(target))
         except KeyboardInterrupt:
-            _print("\n  LB test interrupted." if not _RICH else "\n  [yellow]LB test interrupted.[/yellow]")
+            _print("\n  LB test interrupted." if not _RICH else "\n  [warn]LB test interrupted.[/warn]")
 
         cont = _choose("Continue to attack configuration?", ["y", "n"], "y")
         if cont != "y":
@@ -1932,9 +1998,9 @@ def main() -> None:
     # System prompt — asked after the LB test so the user can observe baseline
     # routing before deciding whether to pin a prefix.
     _print(
-        "\n  [dim]System prompt — sent with every attack and probe request. "
+        "\n  [hint]System prompt — sent with every attack and probe request. "
         "A shared prefix pins concurrent requests to the same KV-cache slot "
-        "via prefix-aware routing. Leave blank to omit.[/dim]"
+        "via prefix-aware routing. Leave blank to omit.[/hint]"
         if _RICH else
         "\n  System prompt — sent with every attack and probe request. A shared prefix\n"
         "  pins requests to the same KV-cache slot via prefix-aware routing.\n"
@@ -1946,9 +2012,9 @@ def main() -> None:
         target = dataclasses.replace(target, system_prompt=system_prompt_raw)
 
     _print(
-        "\n  [dim]Request prefix — prepended to every attack and probe message. "
+        "\n  [hint]Request prefix — prepended to every attack and probe message. "
         "A shared prefix pins all requests to the same KV-cache slot via "
-        "prefix-aware routing. Leave blank to omit.[/dim]"
+        "prefix-aware routing. Leave blank to omit.[/hint]"
         if _RICH else
         "\n  Request prefix — prepended to every attack and probe message.\n"
         "  A shared prefix pins requests to the same KV-cache slot via\n"

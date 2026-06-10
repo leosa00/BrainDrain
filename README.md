@@ -231,7 +231,9 @@ Attack type (reasoning_bomb / think_trap) [reasoning_bomb]:
 Number of concurrent attacker instances [4]:
 ```
 
-How many independent request loops to run in parallel. Each instance continuously sends a new request as soon as the previous one completes. Higher values fill the KV cache faster. Use the KV saturation calculator output as the target minimum.
+How many concurrent requests to keep in flight. A semaphore-based dispatcher maintains *exactly* this many in-flight requests at all times: the instant any request finishes (success, error, or dropped connection) its slot is refilled immediately, with no fixed backoff between requests. Higher values fill the KV cache faster. Use the KV saturation calculator output as the target minimum.
+
+**Dead-connection handling:** Each socket uses aggressive TCP keepalive, so a request whose backend has gone away (process restart, connection reset, or a peer that silently stops responding) is detected within ~60 s and its slot is recycled rather than hanging forever. Requests that have produced no token for several seconds are flagged as stalled (typically a server-side preemption/swap under KV pressure) and surfaced in the live panel's *Req phases* field. This prevents the "request bleed" where dead slots would otherwise reduce real concurrency below the configured target.
 
 ---
 
@@ -280,6 +282,14 @@ Puzzle budget tier (128 / 256 / 512 / mixed) [256]:
 
 Each concurrent instance is assigned a different puzzle index so requests do not share a prompt (which would allow the server to serve them from prefix cache rather than computing a full response).
 
+```
+Cache-bust each request (defeats KV prefix cache)? (no / yes) [no]:
+```
+
+**Cache busting:** When enabled, a unique random nonce (`[id:xxxxxxxx]`) is prepended to every puzzle before it is sent. Because no two requests share an identical prefix, the server's Automatic Prefix Caching cannot serve a request from a previously computed prefix — every request forces a full prefill and a fresh KV-cache allocation. Use this when you want to guarantee maximum compute and memory pressure and defeat any prefix-cache deduplication on the target. Leave it `no` if you instead want to *pin* all requests to a single KV slot via a shared prefix (see [System Prompt and Request Prefix](#4-system-prompt-and-request-prefix)) — the two strategies are opposites.
+
+> In the non-interactive script this maps to the `--cache-bust` flag (see [Script interface](#script-interface-non-interactive)). It only applies to the `reasoning_bomb` attack.
+
 ---
 
 #### ThinkTrap specific options
@@ -325,13 +335,22 @@ Inserts a sleep between consuming each streamed chunk from the server. This back
 
 Recommended range: `0.005` – `0.02` seconds (5–20 ms per chunk).
 
-#### ITL probing
+> **ITL probing is now always on.** The orchestrator fires a lightweight probe request every 10 seconds to estimate KV-cache utilisation and classify the infra state in the live panel. (Earlier versions had a wizard toggle to disable it; that prompt has been removed.)
 
-```
-Enable ITL probing during attack? (y / n) [y]:
-```
+---
 
-When enabled, the orchestrator fires lightweight probe requests every 10 seconds and displays real-time KV-cache utilisation estimates and infra state classifications in the live status panel. When disabled, no probe requests are sent (useful if the target rate-limits all traffic and you need to preserve the full quota for attack requests).
+## Results & Logging
+
+Every interactive run now records its data to the `results/` directory automatically — no flag required. Two files are written per run, named after a run tag (`<model>-<budget_tier>` for reasoning bomb, `<model>` otherwise):
+
+| File | Contents |
+|---|---|
+| `results/<tag>_attack.json` | Final run summary: `run_meta` (model, target, instances, max_tokens, budget, attack-specific params) plus all aggregate result metrics and per-instance stats. Written when the attack stops. |
+| `results/<tag>_probes.jsonl` | One JSON object per line, streamed live during the attack. A leading `run_meta` line, then a mix of probe rows (ITL / TTFT / KV estimate per probe tick) and `phase_snapshot` rows. |
+
+The `phase_snapshot` rows record, at each probe tick, how many in-flight requests are in each phase (e.g. connecting, awaiting-first-token, streaming) versus the target instance count — this lets you analyse the gap between *dispatched* and *actively generating* requests after the fact (e.g. requests stalled by server-side preemption under KV pressure).
+
+> The non-interactive `bdscript.py` continues to use `-o / --output` to write a single summary JSON (see [Script interface](#script-interface-non-interactive)).
 
 ---
 
@@ -342,7 +361,8 @@ During the attack a live panel shows:
 | Field | Description |
 |---|---|
 | Elapsed | Wall-clock time since launch |
-| Instances | Number of active attack loops |
+| Instances | Active in-flight requests vs target instance count (e.g. `7/8`) |
+| Req phases | Breakdown of in-flight requests by phase (connecting / awaiting first token / streaming). Shown in green when all instances are generating, amber when some slots are stalled or not yet running |
 | Requests | Total requests completed so far |
 | Output tokens | Cumulative completion + reasoning tokens generated (vs budget if set) |
 | Input tokens | Cumulative prompt tokens consumed |
@@ -378,6 +398,9 @@ If 10 consecutive requests fail with the same classifiable error, the attack pau
 | `auth` | Enter a new API key |
 | `model_not_found` | Enter the correct model name |
 | `rate_limit` | Enter an inter-request delay in seconds |
+| `network` | Connection-level failure or HTTP 5xx (502 / 503 / 504) — verify the target is reachable, then continue |
+
+Errors are classified by HTTP status code first (so e.g. a "too many requests" string in a 503 body can't be misread as a rate-limit), falling back to message-text matching for non-HTTP errors.
 
 After correcting the setting, choose `y` to restart the instances with the updated configuration, or `n` to stop.
 
@@ -479,11 +502,11 @@ python bdscript.py --help
 | `--no-preflight` | — | off |
 | `--puzzle-file PATH` | Puzzle JSON file | `prompts/reasoningBomb_puzzles.json` |
 | `--budget-tier TIER` | Budget tier | `256` |
+| `--cache-bust` | Cache-bust each request (reasoning_bomb only) | off |
 | `--prompts-file PATH` | ThinkTrap prompts file | `prompts/thinktrap_prompts.json` |
 | `--stagger SECONDS` | Launch stagger | `0` |
 | `--spread PERCENT` | Max-token spread | `0` |
 | `--stream-delay SECONDS` | Stream read delay | `0` |
-| `--no-probe` | ITL probing toggle | off |
 | `-o / --output PATH` | — | — |
 
 ### `--output` JSON format
@@ -501,10 +524,10 @@ When `--output results.json` is provided, a JSON file is written after the attac
     "max_tokens": 16384,
     "budget": null,
     "budget_tier": "256",
+    "cache_bust": false,
     "stagger_s": 8.0,
     "spread_pct": 25.0,
     "stream_delay_s": 0.01,
-    "no_probe": false,
     "system_prompt": null,
     "request_prefix": null
   },
@@ -542,6 +565,12 @@ python bdscript.py \
     --format anthropic --api-key sk-ant-... \
     --attack reasoning_bomb --budget-tier 128 --instances 6
 
+# Cache-busting reasoning bomb — defeat prefix caching, max prefill pressure
+python bdscript.py \
+    -t http://10.0.0.1:8000 -m deepseek-r1-7b \
+    --attack reasoning_bomb --budget-tier 128 --instances 8 \
+    --cache-bust --output results/cachebust.json
+
 # Custom descriptor (e.g. Vertex AI with extended-thinking headers)
 python bdscript.py \
     --format custom --custom-descriptor descriptor.json \
@@ -567,7 +596,8 @@ BrainDrain/
 ├── core/
 │   └── base_attack.py         # Abstract base class, TargetConfig, AttackConfig
 ├── orchestration/
-│   ├── attacker_instance.py   # Single sustained request loop
+│   ├── attacker_instance.py   # Single request executor (one slot)
+│   ├── dispatcher.py          # Semaphore dispatcher — keeps exactly N requests in flight
 │   ├── registry.py            # Attack config factory helpers
 │   └── result_collector.py    # Result aggregation and summary
 ├── probes/

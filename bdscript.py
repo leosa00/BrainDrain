@@ -222,6 +222,14 @@ EXAMPLES
              "higher amplification ratios. 'mixed' rotates 128/256/512 across "
              "instances to prevent synchronised completions.",
     )
+    rb.add_argument(
+        "--cache-bust", action="store_true",
+        help="Prepend a unique random nonce to every puzzle so no two requests "
+             "share a prefix (default: off). Defeats the server's Automatic "
+             "Prefix Caching, forcing a full prefill and a fresh KV-cache "
+             "allocation per request. Opposite strategy to a shared "
+             "--system-prompt / --request-prefix prefix pin.",
+    )
 
     # ── ThinkTrap ─────────────────────────────────────────────────────────────
     tt = p.add_argument_group(
@@ -416,6 +424,7 @@ def _save_output(path: str, args: argparse.Namespace, target: TargetConfig,
             "max_tokens":     max_tokens,
             "budget":         args.budget,
             "budget_tier":    args.budget_tier if args.attack == "reasoning_bomb" else None,
+            "cache_bust":     args.cache_bust if args.attack == "reasoning_bomb" else None,
             "stagger_s":      args.stagger,
             "spread_pct":     args.spread,
             "stream_delay_s": args.stream_delay,
@@ -444,6 +453,7 @@ def main() -> None:
     if args.attack == "reasoning_bomb":
         extra["puzzle_file"] = args.puzzle_file
         extra["budget_tier"] = args.budget_tier
+        extra["cache_bust"]  = args.cache_bust
     elif args.attack == "think_trap":
         extra["prompts_file"] = args.prompts_file
 
